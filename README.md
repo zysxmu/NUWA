@@ -1,4 +1,4 @@
-# Code for NUWA
+# Offical code for Large mRNA language foundation modeling with NUWA for unified sequence perception and
 
 
 ## Pretraining
@@ -136,7 +136,9 @@ Please download the dataset from [here](https://github.com/Sanofi-Public/CodonBE
  ```
 
 
-3. To finetune NUWA to compare with BEACON or on the protein dataset, please see the README.md of the directory RNABenchmark-main and ProtHyena, respectively.
+3. To finetune NUWA to compare with BEACON, please unzip RNABenchmark-main.zip and follow it READMD.md
+
+4. To finetune NUWA on protein, please use the zip in [here](https://drive.google.com/file/d/1SKWNNBqhU1CVcSuhk0GdVldeWLC_7JFp/view?usp=sharing)
 
 ## Generation (Generation task)
 
