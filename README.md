@@ -1,5 +1,8 @@
-# Offical code for Large mRNA language foundation modeling with NUWA for unified sequence perception and generation
+# Official code for Large mRNA language foundation modeling with NUWA for unified sequence perception and generation
 
+## Enviorments
+
+Please install the neccessary package by checking requirements.txt
 
 ## Pretraining
 
