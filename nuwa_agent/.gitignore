@@ -1,0 +1,23 @@
+# ---- 敏感 / 本地配置：绝不提交 ----
+config.py
+*.bak
+*.bak_*
+secrets.py
+
+# ---- Python 缓存（可能含编译后的明文 key） ----
+__pycache__/
+*.pyc
+*.pyo
+
+# ---- 运行输出 ----
+output/
+data/
+results/
+*.log
+*.csv
+*.jsonl
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
