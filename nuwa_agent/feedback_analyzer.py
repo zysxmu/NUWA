@@ -1,6 +1,7 @@
 """LLM Feedback Analyzer: 分析 Pareto 结果 → 生成改进反馈
 
-支持相关性驱动反馈: 每轮计算可解释指标 (CAI/GC/MFE/Stem/Homo/Immuno)
+支持相关性驱动反馈: 每轮计算可解释指标
+(CAI/GC/MFE per nt/Stem/Homo)
 与三个微调模型分数 (TE/Stability/Expression) 的 Spearman 相关系数，
 让 LLM 知道哪些可解释指标真正驱动了打分上涨。
 """
@@ -184,6 +185,8 @@ class FeedbackAnalyzer:
 
                 result = json.loads(content)
                 result["raw_response"] = raw_content
+                # 2026-08-24: 保存发送给 LLM 的 prompt, 否则反馈环节提示词无法复现/审计
+                result["prompt"] = prompt
                 result["score_correlations"] = score_correlations
                 result["generation_directives"] = result.get("generation_directives", {}) or {}
                 # 记录到历史 (用于下一轮避免重复建议)
@@ -211,6 +214,7 @@ class FeedbackAnalyzer:
             "feedback": f"改进 {weakest_obj} 同时保持其他目标。当前 min {weakest_obj}={min_scores[weakest_obj]:.3f}。",
             "overall_assessment": f"第 {round_num} 轮, {len(feasible)} 个可行解。",
             "raw_response": "LLM call failed after retries",
+            "prompt": prompt,
             "score_correlations": score_correlations,
             "generation_directives": {"focus_objective": "balanced", "cai_intensity": 0.25,
                                      "mutate_fraction": 0.5, "explore": 1.0},
@@ -228,7 +232,7 @@ class FeedbackAnalyzer:
                 f"TE={r.te_score:.3f}, Stab={r.stability_score:.3f}, "
                 f"Expr={r.expression_score:.3f}, "
                 f"CAI={r.cai:.3f}, GC={r.gc_content:.1%}, "
-                f"MFE={r.mfe:.1f}, ImmRisk={r.immunogenicity_risk:.3f}, "
+                f"MFE={r.mfe:.1f}, "
                 f"Feasible={r.is_feasible}"
             )
         if len(solutions) > 5:
@@ -246,10 +250,9 @@ class FeedbackAnalyzer:
         可解释指标 (LLM 能理解并操作的):
           - CAI (密码子适应指数)
           - GC% (GC 含量)
-          - MFE (最小自由能, 越负结构越稳定)
+          - MFE/nt (长度归一化最小自由能)
           - Stem (最大茎区长度)
           - Homo (最大同聚物长度)
-          - Immuno (免疫原性风险)
 
         模型打分 (黑盒, LLM 不知道内部逻辑):
           - TE (翻译效率, finetuned_model_TE)
@@ -258,9 +261,9 @@ class FeedbackAnalyzer:
 
         Returns:
             {
-                "TE": {"cai": 0.35, "gc": 0.12, "mfe": -0.08, ...},
-                "Stability": {"cai": 0.21, "gc": 0.45, "mfe": -0.72, ...},
-                "Expression": {"cai": 0.52, "gc": 0.18, "mfe": -0.33, ...},
+                "TE": {"cai": 0.35, "gc": 0.12, "mfe_nt": -0.08, ...},
+                "Stability": {"cai": 0.21, "gc": 0.45, "mfe_nt": -0.72, ...},
+                "Expression": {"cai": 0.52, "gc": 0.18, "mfe_nt": -0.33, ...},
             }
         """
         if not all_results or len(all_results) < 5:
@@ -269,10 +272,12 @@ class FeedbackAnalyzer:
         # 提取可解释指标向量
         cai_vals = np.array([r.cai for r in all_results])
         gc_vals = np.array([r.gc_content for r in all_results])
-        mfe_vals = np.array([r.mfe for r in all_results])
+        mfe_vals = np.array([
+            r.mfe / max(1, len(r.sequence.replace(" ", "")))
+            for r in all_results
+        ])
         stem_vals = np.array([r.max_stem_len for r in all_results], dtype=float)
         homo_vals = np.array([r.max_homopolymer for r in all_results], dtype=float)
-        immuno_vals = np.array([r.immunogenicity_risk for r in all_results])
 
         # 提取模型打分向量
         te_vals = np.array([r.te_score for r in all_results])
@@ -282,10 +287,9 @@ class FeedbackAnalyzer:
         interpretable = {
             "cai": cai_vals,
             "gc": gc_vals,
-            "mfe": mfe_vals,
+            "mfe_nt": mfe_vals,
             "stem": stem_vals,
             "homo": homo_vals,
-            "immuno": immuno_vals,
         }
 
         score_targets = {
@@ -294,13 +298,24 @@ class FeedbackAnalyzer:
             "Expression": expr_vals,
         }
 
-        # 计算 Spearman
+        # 计算真正的 Spearman：即使 scipy 不可用，也对秩而非原值求相关。
         if _has_scipy():
             from scipy.stats import spearmanr
             corr_fn = lambda x, y: spearmanr(x, y)[0]
         else:
-            # 用 numpy 实现 Pearson 近似 (退而求其次)
-            corr_fn = lambda x, y: float(np.corrcoef(x, y)[0, 1])
+            def rankdata(values):
+                order = np.argsort(values, kind="mergesort")
+                ranks = np.empty(len(values), dtype=float)
+                start = 0
+                while start < len(values):
+                    end = start + 1
+                    while end < len(values) and values[order[end]] == values[order[start]]:
+                        end += 1
+                    ranks[order[start:end]] = (start + end - 1) / 2.0
+                    start = end
+                return ranks
+
+            corr_fn = lambda x, y: float(np.corrcoef(rankdata(x), rankdata(y))[0, 1])
 
         correlations = {}
         for score_name, score_vec in score_targets.items():
@@ -310,8 +325,9 @@ class FeedbackAnalyzer:
                 if np.std(metric_vec) < 1e-9 or np.std(score_vec) < 1e-9:
                     correlations[score_name][metric_name] = 0.0
                 else:
-                    correlations[score_name][metric_name] = round(
-                        float(corr_fn(metric_vec, score_vec)), 4
+                    value = float(corr_fn(metric_vec, score_vec))
+                    correlations[score_name][metric_name] = (
+                        round(value, 4) if np.isfinite(value) else 0.0
                     )
 
         return correlations
@@ -322,11 +338,11 @@ class FeedbackAnalyzer:
 
         输出示例:
           ## 打分驱动因子 (Spearman r)
-          | 模型目标    | CAI   | GC%   | MFE   | Stem  | Homo  | Immuno |
-          |------------|-------|-------|-------|-------|-------|--------|
-          | TE         | +0.35 | +0.12 | -0.08 | +0.01 | 0.00  | -0.03  |
-          | Stability  | +0.21 | +0.45 | -0.72 | -0.15 | -0.02 | -0.10  |
-          | Expression | +0.52 | +0.18 | -0.33 | -0.08 | -0.01 | -0.05  |
+          | 模型目标    | CAI   | GC%   | MFE/nt | Stem  | Homo  |
+          |------------|-------|-------|--------|-------|-------|
+          | TE         | +0.35 | +0.12 | -0.08  | +0.01 | 0.00  |
+          | Stability  | +0.21 | +0.45 | -0.72  | -0.15 | -0.02 |
+          | Expression | +0.52 | +0.18 | -0.33  | -0.08 | -0.01 |
 
           解读:
           - TE 主要受 CAI 正向驱动 (r=+0.35)，提升 CAI 可能提升 TE 打分

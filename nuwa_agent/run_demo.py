@@ -22,6 +22,7 @@ config.NUM_CANDIDATES = 20
 config.MAX_ITERATION_ROUNDS = 3
 config.MIN_ITERATION_ROUNDS = 2
 config.PARETO_TOP_K = 5
+config.STRICT_EVALUATION = False
 
 import main
 main.main()

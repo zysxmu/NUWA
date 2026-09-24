@@ -1,0 +1,24 @@
+# NUWA-Agent v6 运行依赖
+# 安装： pip install -r requirements.txt
+# 外部工具（ViennaRNA / cai2）见 README 的“环境准备”一节，部分需用 conda 安装
+
+# ---- 核心 ----
+torch>=2.0
+transformers>=4.30
+tokenizers>=0.13
+safetensors>=0.3
+
+# ---- LLM 调用 ----
+openai>=1.0.0
+
+# ---- 数值 / 优化 ----
+numpy
+scipy
+tqdm
+pymoo          # 超体积 (Hypervolume) 计算
+
+# ---- 外部生物信息学工具（软目标 + 硬约束）----
+# ViennaRNA:  conda install -c bioconda viennarna     (提供 RNA.fold / RNA.subopt)
+# cai2:       pip install cai2                          (CAI 计算)
+
+# 若上述外部工具未安装，evaluator 会自动回退到启发式估算（结果可用但不精确）。

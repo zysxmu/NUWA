@@ -16,10 +16,15 @@ from evaluator import MultiObjectiveEvaluator, EvaluationResult
 from constraint_checker import ConstraintChecker
 from pareto_selector import ParetoSelector
 from feedback_analyzer import FeedbackAnalyzer
+from round_deliberation import RoundDeliberation
 from model_registry import registry
-from config import MAX_ITERATION_ROUNDS, MIN_ITERATION_ROUNDS, HV_CONVERGENCE_THRESHOLD, NUM_CANDIDATES, PARETO_TOP_K
+from config import (MAX_ITERATION_ROUNDS, MIN_ITERATION_ROUNDS,
+                    HV_CONVERGENCE_THRESHOLD, HV_CONVERGENCE_PATIENCE,
+                    HV_BEST_GAP_TOLERANCE, NUM_CANDIDATES, PARETO_TOP_K,
+                    MULTIAGENT_ENABLED)
 
 import random
+import math
 import numpy as np
 from typing import Optional, List, Tuple, Dict, Any
 
@@ -44,7 +49,8 @@ class IterationController:
     def __init__(self, selected_model: str, constraint_bounds: dict,
                  evaluator: MultiObjectiveEvaluator,
                  class_id: int = 0,
-                 codon_table: dict = None):
+                 codon_table: dict = None,
+                 deliberator: Optional[RoundDeliberation] = None):
         self.selected_model = selected_model
         self.constraint_bounds = constraint_bounds
         self.evaluator = evaluator
@@ -53,15 +59,19 @@ class IterationController:
         self.checker = ConstraintChecker(constraint_bounds)
         self.selector = ParetoSelector()
         self.analyzer = FeedbackAnalyzer()
+        self.deliberator = deliberator if deliberator is not None else RoundDeliberation()
 
         self.history = []
         self.prev_hv = 0.0
         self._elite_sequences: list = []  # 上轮 Pareto 前沿序列 (RNA 字符串)
         self._elite_solutions: list = []  # 上轮 Pareto 前沿解 (含分数, 供 focus 偏置)
-        self._last_directives: dict = None  # 上一轮 feedback 的 generation_directives
+        self._last_directives: dict = None  # 上一轮中央 LLM 的结构化决策
         self._best_hv: float = 0.0        # 历史最高 HV
         self._best_solutions: list = []   # HV 最高轮的 Pareto 解
         self._best_round: int = 0         # HV 最高轮的轮次
+        self._stable_rounds: int = 0      # 接近历史最优且变化很小的连续轮数
+        self._consecutive_hv_declines: int = 0
+        self._elite_source: str = "none"
         self._good_sequences_queue: list = []  # 每轮收集的好的序列 (可行 Pareto 前沿)
         self._good_seq_seen: set = set()       # 已入队序列的去重集合
 
@@ -79,6 +89,16 @@ class IterationController:
             }
         """
         feedback = None
+        self.history = []
+        self.prev_hv = 0.0
+        self._best_hv = 0.0
+        self._best_solutions = []
+        self._best_round = 0
+        self._stable_rounds = 0
+        self._consecutive_hv_declines = 0
+        self._elite_source = "none"
+        self._good_sequences_queue = []
+        self._good_seq_seen = set()
         self._elite_sequences = []   # 每轮更新
         self._elite_solutions = []
         self._last_directives = None
@@ -86,21 +106,19 @@ class IterationController:
         for round_num in range(1, MAX_ITERATION_ROUNDS + 1):
             print(f"\n[Round {round_num}/{MAX_ITERATION_ROUNDS}]")
 
-            # 温度在前40%轮次内从1.0线性衰减到0.3, 之后保持0.3
-            decay_rounds = max(1, int(MAX_ITERATION_ROUNDS * 0.4))
-            base_temperature = max(0.3, 1.0 - 0.7 * (round_num - 1) / decay_rounds)
-
-            # 读取上一轮 feedback 的 generation_directives (机器指令, 默认保留原行为)
-            directives = self._sanitize_directives(self._last_directives)
-
-            # explore 调节探索度: 默认 1.0 时温度不变, 越小越利用
-            explore = directives.get("explore", 1.0)
-            temperature = max(0.3, base_temperature * (0.4 + 0.6 * explore))
+            # 第 1 轮使用预注册基线；之后执行上一轮中央 LLM 的决策。
+            # 无可用父本时强制全新生成，并记录实际应用值。
+            requested = self._last_directives or self._default_decision(round_num)
+            directives = self._sanitize_directives(requested, round_num)
+            if round_num == 1 or not self._elite_sequences:
+                directives["mutate_fraction"] = 0.0
+            temperature = directives["temperature"]
 
             # Step A: 生成候选 (新生成 + 精英突变), 指令随 feedback 动态调整
             candidates, gen_meta = self._generate_candidates(
                 protein_seq, round_num, temperature, feedback, directives=directives
             )
+            self._validate_candidate_translations(candidates, protein_seq)
 
             # Step B: 评估 (外部生物信息学工具)
             print("  Evaluating with external bioinformatics tools...")
@@ -108,16 +126,13 @@ class IterationController:
 
             # Step C: 约束 + Pareto
             results = self.checker.check_batch(results)
+            if not results:
+                raise RuntimeError("本轮没有可评估候选，无法继续优化")
             feasible_count = sum(1 for r in results if r.is_feasible)
             print(f"  Feasible: {feasible_count}/{len(results)}")
 
-            pareto_solutions = self.selector.select(results, top_k=PARETO_TOP_K)
-
-            # 更新精英序列 (供下一轮突变用)
-            self._elite_sequences = [
-                s.result.sequence for s in pareto_solutions if s.rank == 0
-            ]
-            self._elite_solutions = [s for s in pareto_solutions if s.rank == 0]
+            # 保留全部可行解完成非支配排序与 HV。
+            pareto_solutions = self.selector.select(results, top_k=None)
 
             hv = self.selector.compute_hypervolume(pareto_solutions)
             hv_improvement = hv - self.prev_hv
@@ -126,9 +141,36 @@ class IterationController:
             # 追踪历史最优 HV 和对应解 (修复 P0: 收敛时返回最优轮而非当前轮)
             if hv > self._best_hv:
                 self._best_hv = hv
-                self._best_solutions = list(pareto_solutions)  # 深拷贝引用
+                self._best_solutions = [s for s in pareto_solutions if s.rank == 0]
                 self._best_round = round_num
                 print(f"  📈 新最优 HV: {hv:.4f} (Round {round_num})")
+
+            best_gap = max(0.0, self._best_hv - hv)
+            if hv_improvement < 0:
+                self._consecutive_hv_declines += 1
+            else:
+                self._consecutive_hv_declines = 0
+            if (best_gap <= HV_BEST_GAP_TOLERANCE
+                    and abs(hv_improvement) < HV_CONVERGENCE_THRESHOLD):
+                self._stable_rounds += 1
+            else:
+                self._stable_rounds = 0
+
+            # Do not let a regressed generation replace the parent archive and
+            # recursively amplify its own degradation. Once the current front
+            # falls materially below the best, mutate the historical best front.
+            current_elites = [s for s in pareto_solutions if s.rank == 0][:PARETO_TOP_K]
+            if self._best_solutions and best_gap > HV_BEST_GAP_TOLERANCE:
+                elite_parents = self._best_solutions[:PARETO_TOP_K]
+                self._elite_source = f"historical_best_round_{self._best_round}"
+            else:
+                elite_parents = current_elites
+                self._elite_source = f"current_round_{round_num}"
+            if not elite_parents and pareto_solutions:
+                elite_parents = [s for s in pareto_solutions if s.rank == 999][:PARETO_TOP_K]
+                self._elite_source = f"recovery_round_{round_num}"
+            self._elite_sequences = [s.result.sequence for s in elite_parents]
+            self._elite_solutions = elite_parents
 
             # ---- 收集本轮好的序列到输出队列 ----
             # 收集所有 rank=0 且 feasible 的 Pareto 前沿解, 去重后入队
@@ -150,7 +192,6 @@ class IterationController:
                             "mfe": round(r.mfe, 3),
                             "max_stem_len": r.max_stem_len,
                             "max_homopolymer": r.max_homopolymer,
-                            "immunogenicity_risk": round(r.immunogenicity_risk, 6),
                             "crowding_distance": round(s.crowding_distance, 6),
                             "is_feasible": True,
                         })
@@ -167,7 +208,7 @@ class IterationController:
                     print(f"    Rank {s.rank}: TE={r.te_score:.3f} Stab={r.stability_score:.3f} "
                           f"Expr={r.expression_score:.3f} | CAI={r.cai:.3f} GC={r.gc_content:.1%} "
                           f"MFE={r.mfe:.1f} Stem={r.max_stem_len} Homo={r.max_homopolymer} "
-                          f"Immuno={r.immunogenicity_risk:.3f} | Feasible={r.is_feasible}")
+                          f"| Feasible={r.is_feasible}")
 
             # 打印次优前沿 (rank=1) 摘要
             rank1 = [s for s in pareto_solutions if s.rank == 1]
@@ -178,31 +219,70 @@ class IterationController:
                       f"Expr={r.expression_score:.3f}")
 
             print(f"  HV: {hv:.4f} (Δ{hv_improvement:+.4f})")
-            print(f"  Pareto front: {front_size} solutions (top-{PARETO_TOP_K} shown above)")
+            print(f"  Pareto front: {front_size} solutions")
 
-            # Step D: LLM 反馈 (传入完整评估结果用于相关性分析)
-            if round_num < MAX_ITERATION_ROUNDS:
-                analysis = self.analyzer.analyze(
-                    pareto_solutions, round_num, host_organism, self.constraint_bounds,
-                    all_results=results,   # ← 全部候选评估结果, 用于计算相关性
-                )
-                feedback = analysis["feedback"]
-                self._last_directives = analysis.get("generation_directives", {}) or {}
-                print(f"  Feedback: {feedback[:80]}...")
-                print(f"  Directives: {self._last_directives}")
-                # 打印本轮相关性摘要
-                score_corr = analysis.get("score_correlations", {})
-                if score_corr:
-                    for obj_name, corrs in score_corr.items():
-                        sig = [(m, v) for m, v in corrs.items() if abs(v) > 0.2]
-                        if sig:
-                            sig_str = ", ".join(
-                                f"{m}({v:+.2f})" for m, v in sorted(sig, key=lambda x: -abs(x[1]))
-                            )
-                            print(f"    [{obj_name} drivers] {sig_str}")
-            else:
-                analysis = {"weaknesses": [], "suggestions": [],
-                            "feedback": "", "overall_assessment": ""}
+            # Step D: 数值证据先计算，再由专家往返讨论和中央 LLM 裁决。
+            # 相关性只描述本轮样本关联，不赋予 Agent 修改分数/约束的权限。
+            score_corr = (self.analyzer._compute_score_correlations(results)
+                          if len(results) >= 5 else {})
+            round_summary = self._build_round_summary(
+                round_num, protein_seq, host_organism, results, pareto_solutions,
+                hv, hv_improvement, directives, score_corr, gen_meta,
+            )
+            converged_now = self._has_converged(round_num, feasible_count, hv)
+            discussion = {"decision": None, "transcript": [],
+                          "fallback_used": False, "error": None,
+                          "skip_reason": None}
+            if round_num < MAX_ITERATION_ROUNDS and not converged_now:
+                fallback = self._default_decision(round_num + 1)
+                if MULTIAGENT_ENABLED:
+                    try:
+                        discussion = self.deliberator.decide(round_summary, fallback)
+                    except Exception as exc:
+                        discussion = {"decision": fallback, "transcript": [],
+                                      "fallback_used": True,
+                                      "error": f"deliberation: {type(exc).__name__}"}
+                else:
+                    discussion = {"decision": fallback, "transcript": [],
+                                  "fallback_used": True,
+                                  "error": "multi-agent discussion disabled"}
+                try:
+                    proposed = self._sanitize_directives(
+                        discussion.get("decision"), round_num + 1
+                    )
+                    discussion["requested_decision"] = dict(proposed)
+                    self._last_directives, guardrail = self._guard_next_decision(
+                        proposed, directives, round_summary
+                    )
+                    self._last_directives["rationale"] = self._execution_summary(
+                        proposed, self._last_directives, guardrail
+                    )
+                    discussion["guardrail"] = guardrail
+                    discussion["adjusted_decision"] = dict(self._last_directives)
+                    discussion["decision"] = dict(self._last_directives)
+                except ValueError as exc:
+                    self._last_directives = self._sanitize_directives(fallback, round_num + 1)
+                    discussion["requested_decision"] = None
+                    discussion["adjusted_decision"] = dict(self._last_directives)
+                    discussion["decision"] = dict(self._last_directives)
+                    discussion["fallback_used"] = True
+                    discussion["error"] = f"controller validation: {type(exc).__name__}"
+                    discussion["guardrail"] = {"applied": False, "adjustments": []}
+                feedback = self._last_directives.get("rationale", "")
+                print(f"  Central LLM next-round decision: {self._last_directives}")
+            elif round_num >= MAX_ITERATION_ROUNDS:
+                discussion["skip_reason"] = "final_round_has_no_next_round"
+            elif converged_now:
+                discussion["skip_reason"] = "optimization_converged"
+
+            central_decision = discussion.get("decision")
+            analysis = {
+                "feedback": (central_decision or {}).get("rationale", ""),
+                "weaknesses": [],
+                "suggestions": [],
+                "overall_assessment": "no feasible candidates" if not feasible_count else "",
+                "generation_directives": central_decision or {},
+            }
 
             # ---- 构建本轮完整候选打分表 (所有候选) ----
             candidate_scores = []
@@ -220,7 +300,6 @@ class IterationController:
                     "mfe": round(r.mfe, 3),
                     "max_stem_len": r.max_stem_len,
                     "max_homopolymer": r.max_homopolymer,
-                    "immunogenicity_risk": round(r.immunogenicity_risk, 6),
                     "is_feasible": r.is_feasible,
                 })
 
@@ -243,7 +322,6 @@ class IterationController:
                         "MFE": round(r.mfe, 3),
                         "max_stem_len": r.max_stem_len,
                         "max_homopolymer": r.max_homopolymer,
-                        "immunogenicity_risk": round(r.immunogenicity_risk, 6),
                     },
                     "is_feasible": r.is_feasible,
                 })
@@ -257,13 +335,35 @@ class IterationController:
                 "pareto_front_size": front_size,
                 "hv": round(hv, 6),
                 "hv_improvement": round(hv_improvement, 6),
+                "round_summary": round_summary,
+                "score_correlations": score_corr,
+                "discussion_transcript": discussion.get("transcript", []),
+                "decision_for_round": (round_num + 1 if central_decision else None),
+                "central_requested_decision": discussion.get("requested_decision"),
+                "guardrail_adjusted_decision": discussion.get("adjusted_decision"),
+                "central_decision": central_decision,
+                "applied_decision": {k: directives.get(k) for k in
+                                     ("temperature", "mutate_fraction",
+                                      "substitutions_per_candidate", "parent_focus",
+                                      "evidence_ids")},
+                "applied_decision_origin_round": (round_num - 1 if round_num > 1 else None),
+                "applied_decision_source": (
+                    "previous_round_guardrail_adjusted_decision"
+                    if round_num > 1 else "preregistered_round_1_baseline"
+                ),
+                "discussion_fallback_used": bool(discussion.get("fallback_used", False)),
+                "discussion_error": discussion.get("error"),
+                "discussion_decision_source": discussion.get("decision_source"),
+                "decision_guardrail": discussion.get("guardrail", {}),
+                "discussion_skipped": not bool(discussion.get("transcript")),
+                "discussion_skip_reason": discussion.get("skip_reason"),
                 # 完整反馈 (不截断)
                 "feedback": analysis["feedback"],
+                "next_round_execution_summary": analysis["feedback"],
                 "weaknesses": analysis["weaknesses"],
                 "suggestions": analysis["suggestions"],
                 "overall_assessment": analysis.get("overall_assessment", ""),
                 "generation_directives": analysis.get("generation_directives", {}),
-                "feedback_raw": analysis.get("raw_response", ""),
                 # 生成元数据
                 "generation_meta": gen_meta,
                 # 本轮全部候选打分
@@ -274,16 +374,16 @@ class IterationController:
                 "elite_sequences": list(self._elite_sequences),
             })
 
-            # 收敛判定 (仅在达到最少轮数后检查)
-            # 修复 P0: 原逻辑 hv_improvement < threshold 会将 HV 下降 (负值) 误判为收敛
-            # 新逻辑: 只有 0 ≤ ΔHV < threshold 才判定为收敛 (正改进但很小)
-            #         ΔHV < 0 (HV 下降) 时不收敛，继续迭代
+            # 收敛判定：需要连续稳定，并且当前 HV 仍接近历史最优。
+            # 这防止“大幅退化后的一次小反弹”被误报为收敛。
             if round_num <= MIN_ITERATION_ROUNDS:
                 print(f"  ⏳ 最少 {MIN_ITERATION_ROUNDS} 轮保护中 (当前第 {round_num} 轮)，跳过收敛检查")
-            elif 0 <= hv_improvement < HV_CONVERGENCE_THRESHOLD:
-                print(f"  Converged! ΔHV {hv_improvement:.4f} ∈ [0, {HV_CONVERGENCE_THRESHOLD})")
+            elif converged_now:
+                print(f"  Converged! {self._stable_rounds} stable rounds, "
+                      f"best gap={best_gap:.4f}")
                 # 安全回退: 如果历史最优为空 (所有轮都无可行解), 返回当前轮的解
-                return_solutions = self._best_solutions if self._best_solutions else pareto_solutions
+                recovery = [s for s in pareto_solutions if s.rank == 999][:PARETO_TOP_K]
+                return_solutions = self._best_solutions if self._best_solutions else recovery
                 return_hv = self._best_hv if self._best_solutions else hv
                 return {
                     "best_solutions": return_solutions,
@@ -291,15 +391,21 @@ class IterationController:
                     "good_sequences_queue": self._good_sequences_queue,
                     "total_rounds": round_num,
                     "final_hv": return_hv,
+                    "best_hv": self._best_hv,
+                    "last_round_hv": hv,
+                    "best_round": self._best_round,
                     "converged": True,
                 }
+            elif feasible_count == 0:
+                print("  ⚠️ 本轮无可行解，HV=0 不作为收敛证据；下一轮进入恢复搜索")
             elif hv_improvement < 0:
                 print(f"  ⚠️ HV 下降 ({hv_improvement:.4f}), 继续迭代寻找更优解...")
 
             self.prev_hv = hv
 
         print(f"  Reached max rounds ({MAX_ITERATION_ROUNDS})")
-        return_solutions = self._best_solutions if self._best_solutions else pareto_solutions
+        recovery = [s for s in pareto_solutions if s.rank == 999][:PARETO_TOP_K]
+        return_solutions = self._best_solutions if self._best_solutions else recovery
         return_hv = self._best_hv if self._best_solutions else hv
         return {
             "best_solutions": return_solutions,
@@ -307,6 +413,9 @@ class IterationController:
             "good_sequences_queue": self._good_sequences_queue,
             "total_rounds": MAX_ITERATION_ROUNDS,
             "final_hv": return_hv,
+            "best_hv": self._best_hv,
+            "last_round_hv": hv,
+            "best_round": self._best_round,
             "converged": False,
         }
 
@@ -336,16 +445,28 @@ class IterationController:
         gen_meta: Dict[str, Any] = {
             "new_count": 0,
             "mutated_count": 0,
+            "planned_mutated_count": 0,
+            "mutation_shortfall": 0,
             "sources": {},
             "mutation_details": [],
+            "cai_edit_details": [],
             "elite_parents": list(self._elite_sequences),
+            "elite_parent_source": self._elite_source,
         }
 
-        # 从 directives 提取生成指令 (缺省用类常量, 保留原行为)
-        directives = directives or {}
-        cai_intensity = directives.get("cai_intensity", self.CAI_OPTIMIZE_INTENSITY)
-        mutate_fraction = directives.get("mutate_fraction", self.MUTATE_RATIO)
-        focus_objective = directives.get("focus_objective", "balanced")
+        # 中央 LLM 仅控制温度、生成/突变配比、同义替换次数及父本侧重。
+        # CAI 后处理保持预注册的确定性日程，避免额外混杂因素。
+        directives = directives or self._default_decision(round_num)
+        mutate_fraction = directives["mutate_fraction"]
+        focus_objective = directives["parent_focus"]
+        substitutions = directives["substitutions_per_candidate"]
+        cai_ratio = min(0.6, self.CAI_OPTIMIZE_RATIO + 0.1 * (round_num - 1))
+        # These are the parameters that generated this round. Keep the legacy
+        # key for compatibility, but label the authoritative provenance clearly.
+        gen_meta["requested_decision"] = dict(directives)
+        gen_meta["applied_decision"] = dict(directives)
+        gen_meta["cai_application_fraction"] = cai_ratio
+        gen_meta["cai_intensity"] = self.CAI_OPTIMIZE_INTENSITY
 
         # 第 1 轮或没有精英序列时: 全部新生成
         if round_num == 1 or not self._elite_sequences:
@@ -361,18 +482,20 @@ class IterationController:
             # Round 1 也对 30% 候选做 CAI 优化 (提升初始 CAI 基线)
             if self.codon_table:
                 candidates = self._apply_cai_optimization_batch(
-                    candidates, self.CAI_OPTIMIZE_RATIO, gen_meta, "new_generation",
-                    intensity=cai_intensity
+                    candidates, cai_ratio, gen_meta, "new_generation",
+                    intensity=self.CAI_OPTIMIZE_INTENSITY
                 )
             for i in range(len(candidates)):
                 gen_meta["sources"][i] = "new_generation"
+            if len(candidates) != num_total:
+                raise RuntimeError("NUWA did not generate the requested candidate budget")
+            gen_meta["actual_mutate_fraction"] = 0.0
             return candidates, gen_meta
 
         # 第 2 轮起: 混合策略
         num_mutate = int(round(num_total * mutate_fraction))
         num_new = num_total - num_mutate
-        gen_meta["new_count"] = num_new
-        gen_meta["mutated_count"] = num_mutate
+        gen_meta["planned_mutated_count"] = num_mutate
 
         print(f"  Generating {num_new} new + {num_mutate} mutated candidates (temp={temperature:.1f})...")
 
@@ -388,54 +511,328 @@ class IterationController:
             )
             # 对新生成候选应用 CAI 优化 (比例随轮次递增, 后期更激进优化 CAI)
             if self.codon_table:
-                cai_ratio = min(0.6, self.CAI_OPTIMIZE_RATIO + 0.1 * (round_num - 1))
                 new_candidates = self._apply_cai_optimization_batch(
                     new_candidates, cai_ratio, gen_meta, "new_generation",
-                    intensity=cai_intensity
+                    intensity=self.CAI_OPTIMIZE_INTENSITY
                 )
 
         # 精英突变 (按 focus_objective 偏置选择精英)
         mutated_candidates, mutation_details = self._mutate_elites(
-            protein_seq, num_mutate, focus_objective=focus_objective
+            protein_seq, num_mutate, focus_objective=focus_objective,
+            substitutions_per_candidate=substitutions,
         )
 
         # 对精英突变也应用 CAI 优化 (突破 CAI 停滞)
         if self.codon_table and mutated_candidates:
             mutated_candidates = self._apply_cai_optimization_batch(
-                mutated_candidates, 0.5, gen_meta, "elite_mutation",
-                intensity=cai_intensity
+                mutated_candidates, cai_ratio, gen_meta, "elite_mutation",
+                intensity=self.CAI_OPTIMIZE_INTENSITY
             )
+        for detail, final_sequence in zip(mutation_details, mutated_candidates):
+            detail["post_cai_sequence"] = final_sequence
+            detail["evaluated_sequence"] = final_sequence
+            cai_edits = self._codon_edit_diff(
+                detail["mutated_sequence"], final_sequence
+            )
+            detail["cai_postprocessing"] = {
+                "applied": bool(cai_edits),
+                "num_edits": len(cai_edits),
+                "edits": cai_edits,
+            }
+            detail["provenance_chain"] = [
+                "elite_parent", "synonymous_mutation",
+                "cai_postprocessing" if cai_edits else "cai_postprocessing_no_change",
+                "evaluated_sequence",
+            ]
+
+        initial_new_count = len(new_candidates)
+        # 预检可能拒绝部分同义子代；用同温度 NUWA 生成补齐，保证每轮
+        # 的候选和评估预算固定，并记录实际突变比例。
+        shortfall = num_total - len(new_candidates) - len(mutated_candidates)
+        if shortfall > 0:
+            gen_meta["mutation_shortfall"] = shortfall
+            extra = registry.generate(
+                self.selected_model, protein_seq, num=shortfall,
+                feedback=feedback, temperature=temperature, class_id=self.class_id,
+            )
+            if len(extra) != shortfall:
+                raise RuntimeError("NUWA did not replenish the candidate budget")
+            if self.codon_table:
+                extra = self._apply_cai_optimization_batch(
+                    extra, cai_ratio, gen_meta, "new_generation_replenishment",
+                    intensity=self.CAI_OPTIMIZE_INTENSITY,
+                )
+            new_candidates.extend(extra)
 
         # 合并 + 标记来源
         all_candidates = new_candidates + mutated_candidates
+        gen_meta["new_count"] = len(new_candidates)
+        gen_meta["mutated_count"] = len(mutated_candidates)
+        gen_meta["actual_mutate_fraction"] = (
+            len(mutated_candidates) / len(all_candidates) if all_candidates else 0.0
+        )
         for i in range(len(new_candidates)):
-            gen_meta["sources"][i] = "new_generation"
+            gen_meta["sources"][i] = (
+                "new_generation" if i < initial_new_count
+                else "new_generation_replenishment"
+            )
         for j, detail in enumerate(mutation_details):
             idx = len(new_candidates) + j
             gen_meta["sources"][idx] = f"elite_mutation:{detail.get('elite_index', '?')}"
         gen_meta["mutation_details"] = mutation_details
 
+        if len(all_candidates) != num_total:
+            raise RuntimeError("candidate budget changed after generation and mutation")
+
         return all_candidates, gen_meta
 
     @staticmethod
-    def _sanitize_directives(d: Optional[dict]) -> dict:
-        """清洗 generation_directives: 钳制范围并补默认值, 保证非法值不破坏生成。"""
-        d = d or {}
-        def clamp(v, lo, hi, default):
-            try:
-                v = float(v)
-            except (TypeError, ValueError):
-                return default
-            return max(lo, min(hi, v))
+    def _default_decision(round_num: int) -> dict:
+        """预注册回退策略：前 40% 轮次由 T=1.0 退火至 0.3。"""
+        decay_rounds = max(2, int(math.ceil(MAX_ITERATION_ROUNDS * 0.4)))
+        progress = min(1.0, (round_num - 1) / (decay_rounds - 1))
         return {
-            "focus_objective": d.get("focus_objective", "balanced"),
-            "cai_intensity": clamp(d.get("cai_intensity"), 0.1, 0.5, 0.25),
-            "mutate_fraction": clamp(d.get("mutate_fraction"), 0.0, 1.0, 0.5),
-            "explore": clamp(d.get("explore"), 0.0, 1.0, 1.0),
+            "temperature": round(1.0 - 0.7 * progress, 6),
+            "mutate_fraction": 0.0 if round_num == 1 else 0.5,
+            "substitutions_per_candidate": 2,
+            "parent_focus": "balanced",
+            "evidence_ids": [],
+            "rationale": "Prespecified temperature schedule and 50% elite mutation fallback.",
         }
 
+    @staticmethod
+    def _sanitize_directives(d: Optional[dict], round_num: int) -> dict:
+        """控制器再次校验中央决策；越界值不得进入生成/突变模块。"""
+        if not isinstance(d, dict):
+            raise ValueError("central decision must be a JSON object")
+        try:
+            temperature = float(d["temperature"])
+            mutate_fraction = float(d["mutate_fraction"])
+            substitutions = d["substitutions_per_candidate"]
+            parent_focus = d["parent_focus"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"invalid central decision: {exc}") from exc
+        if not math.isfinite(temperature) or not 0.3 <= temperature <= 1.0:
+            raise ValueError("temperature must be finite and in [0.3, 1.0]")
+        if not math.isfinite(mutate_fraction) or not 0.0 <= mutate_fraction <= 0.75:
+            raise ValueError("mutate_fraction must be finite and in [0, 0.75]")
+        if type(substitutions) is not int or not 1 <= substitutions <= 3:
+            raise ValueError("substitutions_per_candidate must be an integer 1..3")
+        if parent_focus not in ("balanced", "te", "stability", "expression"):
+            raise ValueError("invalid parent_focus")
+        evidence_ids = d.get("evidence_ids", [])
+        if not isinstance(evidence_ids, list) or not all(isinstance(x, str) for x in evidence_ids):
+            raise ValueError("evidence_ids must be a list of strings")
+        rationale = d.get("rationale", "")
+        if not isinstance(rationale, str):
+            raise ValueError("rationale must be a string")
+        return {
+            "temperature": temperature,
+            "mutate_fraction": 0.0 if round_num == 1 else mutate_fraction,
+            "substitutions_per_candidate": substitutions,
+            "parent_focus": parent_focus,
+            "evidence_ids": evidence_ids,
+            "rationale": rationale,
+        }
+
+    def _guard_next_decision(self, proposed: dict, applied: dict,
+                             round_summary: dict) -> Tuple[dict, dict]:
+        """Bound strategy jumps and force conservative recovery after regression.
+
+        The LLM still selects the strategy inside the advertised ranges. This
+        controller-side policy only prevents abrupt, self-reinforcing changes
+        unsupported by the observed optimization trajectory.
+        """
+        guarded = dict(proposed)
+        adjustments = []
+
+        def clamp_step(key: str, max_step: float) -> None:
+            old = float(applied[key])
+            requested = float(guarded[key])
+            bounded = min(old + max_step, max(old - max_step, requested))
+            bounded = round(bounded, 6)
+            if bounded != requested:
+                adjustments.append({"field": key, "requested": requested,
+                                    "applied": bounded, "reason": "step_limit"})
+                guarded[key] = bounded
+
+        clamp_step("temperature", 0.2)
+        clamp_step("mutate_fraction", 0.15)
+
+        best_gap = max(0.0, float(round_summary.get("best_hv", 0.0))
+                       - float(round_summary.get("hv", 0.0)))
+        severe_regression = (self._consecutive_hv_declines >= 2
+                             or best_gap > HV_BEST_GAP_TOLERANCE)
+        if severe_regression:
+            recovery_caps = {
+                "temperature": min(float(guarded["temperature"]),
+                                   float(applied["temperature"])),
+                "mutate_fraction": min(float(guarded["mutate_fraction"]), 0.5),
+                "substitutions_per_candidate": min(
+                    int(guarded["substitutions_per_candidate"]), 2
+                ),
+                "parent_focus": "balanced",
+            }
+            for key, value in recovery_caps.items():
+                if guarded[key] != value:
+                    adjustments.append({"field": key, "requested": guarded[key],
+                                        "applied": value,
+                                        "reason": "regression_recovery"})
+                    guarded[key] = value
+
+        return guarded, {"applied": bool(adjustments),
+                         "adjustments": adjustments,
+                         "consecutive_hv_declines": self._consecutive_hv_declines,
+                         "best_hv_gap": round(best_gap, 6)}
+
+    @staticmethod
+    def _execution_summary(requested: dict, adjusted: dict, guardrail: dict) -> str:
+        """Describe executable values only; keep free-form LLM prose in requested_decision."""
+        summary = (
+            "Next round executable decision: "
+            f"temperature={adjusted['temperature']}, "
+            f"mutate_fraction={adjusted['mutate_fraction']}, "
+            f"substitutions_per_candidate={adjusted['substitutions_per_candidate']}, "
+            f"parent_focus='{adjusted['parent_focus']}'."
+        )
+        changes = guardrail.get("adjustments", []) if isinstance(guardrail, dict) else []
+        if not changes:
+            return summary + " Central request accepted without controller adjustment."
+        rendered = []
+        for item in changes:
+            rendered.append(
+                f"{item.get('field')} {item.get('requested')}→{item.get('applied')} "
+                f"({item.get('reason')})"
+            )
+        return summary + " Controller adjustments: " + "; ".join(rendered) + "."
+
+    def _has_converged(self, round_num: int, feasible_count: int, hv: float) -> bool:
+        """Require a sustained plateau near the best, not a post-crash blip."""
+        return (round_num > MIN_ITERATION_ROUNDS
+                and feasible_count > 0
+                and max(0.0, self._best_hv - hv) <= HV_BEST_GAP_TOLERANCE
+                and self._stable_rounds >= HV_CONVERGENCE_PATIENCE)
+
+    def _build_round_summary(self, round_num: int, protein_seq: str,
+                             host_organism: str, results: list,
+                             pareto_solutions: list, hv: float,
+                             hv_improvement: float, applied_decision: dict,
+                             score_correlations: dict, generation_meta: dict) -> dict:
+        """给专家共享同一份数值证据；不发送完整候选序列。"""
+        feasible_count = sum(bool(r.is_feasible) for r in results)
+        violations = {}
+        for result in results:
+            for violation in result.constraint_violations:
+                name = violation.split("=", 1)[0].strip()
+                violations[name] = violations.get(name, 0) + 1
+        front = []
+        for index, solution in enumerate(pareto_solutions):
+            r = solution.result
+            if solution.rank not in (0, 999):
+                continue
+            clean_len = len(r.sequence.replace(" ", ""))
+            front.append({
+                "candidate_id": index,
+                "rank": solution.rank,
+                "te": round(r.te_score, 6),
+                "stability": round(r.stability_score, 6),
+                "expression": round(r.expression_score, 6),
+                "cai": round(r.cai, 6),
+                "gc": round(r.gc_content, 6),
+                "mfe_per_nt": round(r.mfe / clean_len, 6) if clean_len else None,
+                "stem": r.max_stem_len,
+                "homopolymer": r.max_homopolymer,
+                "violations": list(r.constraint_violations),
+            })
+        effective_bounds = dict(self.constraint_bounds)
+        inactive_bounds = {}
+        if "mfe_per_nt_min" in effective_bounds and "mfe_per_nt_max" in effective_bounds:
+            for key in ("mfe_min", "mfe_max"):
+                if key in effective_bounds:
+                    inactive_bounds[key] = effective_bounds.pop(key)
+        return {
+            "round": round_num,
+            "next_round": round_num + 1,
+            "host": host_organism,
+            "protein_length_aa": len(protein_seq.rstrip("*")),
+            "population_size": len(results),
+            "unique_sequences": len({r.sequence.replace(" ", "").upper() for r in results}),
+            "feasible_count": feasible_count,
+            "feasible_rate": round(feasible_count / len(results), 6),
+            "recovery_mode": feasible_count == 0,
+            "constraint_violations": violations,
+            "hv": round(hv, 6),
+            "hv_delta": round(hv_improvement, 6),
+            "previous_hv": round(self.prev_hv, 6),
+            "best_hv": round(self._best_hv, 6),
+            "best_hv_gap": round(max(0.0, self._best_hv - hv), 6),
+            "best_round": self._best_round,
+            "consecutive_hv_declines": self._consecutive_hv_declines,
+            "stable_rounds": self._stable_rounds,
+            "recent_rounds": [
+                {
+                    "round": item["round"],
+                    "hv": item["hv"],
+                    "hv_delta": item["hv_improvement"],
+                    "feasible_rate": round(
+                        item["feasible_count"] / max(1, item["num_candidates"]), 6
+                    ),
+                    "applied_decision": item.get("applied_decision", {}),
+                }
+                for item in self.history[-3:]
+            ],
+            "pareto_or_recovery_candidates": front,
+            "score_correlations": score_correlations,
+            "correlation_sample_size": len(results),
+            "applied_decision": dict(applied_decision),
+            "actual_new_count": generation_meta.get("new_count", 0),
+            "actual_mutated_count": generation_meta.get("mutated_count", 0),
+            "elite_parent_source": self._elite_source,
+            "host_codon_table_available": bool(self.codon_table),
+            "constraint_bounds": effective_bounds,
+            "inactive_constraint_bounds": inactive_bounds,
+            "constraint_modes": {
+                "mfe": "per_nt" if "mfe_per_nt_min" in effective_bounds else "absolute"
+            },
+            "operator_semantics": {
+                "mutate_fraction": "share replaced by edits of parent sequences; does not repair infeasible samples",
+                "substitutions_per_candidate": "random synonymous positions, not homopolymer-targeted",
+                "parent_focus": "biases selection toward parents weak on that objective; no guaranteed improvement",
+            },
+        }
+
+    @staticmethod
+    def _codon_edit_diff(before_sequence: str, after_sequence: str) -> List[Dict]:
+        """Return the exact codon edits between two sequence-processing stages."""
+        before = before_sequence.replace(" ", "").upper().replace("T", "U")
+        after = after_sequence.replace(" ", "").upper().replace("T", "U")
+        return [
+            {"codon_index": pos // 3, "old_codon": before[pos:pos + 3],
+             "new_codon": after[pos:pos + 3]}
+            for pos in range(0, min(len(before), len(after)), 3)
+            if before[pos:pos + 3] != after[pos:pos + 3]
+        ]
+
+    @staticmethod
+    def _validate_candidate_translations(candidates: List[str], protein_seq: str) -> None:
+        """防止编码错误或模型长度截断的序列进入评分。"""
+        protein = protein_seq.strip().upper().rstrip("*")
+        if not protein or not candidates:
+            raise ValueError("target protein and candidate population must be non-empty")
+        for index, sequence in enumerate(candidates):
+            clean = sequence.replace(" ", "").upper().replace("T", "U")
+            if len(clean) != (len(protein) + 1) * 3:
+                raise ValueError(f"candidate {index} has incorrect CDS length")
+            codons = [clean[i:i + 3] for i in range(0, len(clean), 3)]
+            if CODON_TO_AA.get(codons[-1]) != "*":
+                raise ValueError(f"candidate {index} has no terminal stop codon")
+            translated = "".join(CODON_TO_AA.get(c, "?") for c in codons[:-1])
+            if translated != protein:
+                raise ValueError(f"candidate {index} does not encode the target protein")
+
     def _mutate_elites(self, protein_seq: str, num_needed: int,
-                      focus_objective: str = "balanced") -> Tuple[List[str], List[Dict]]:
+                      focus_objective: str = "balanced",
+                      substitutions_per_candidate: int = 2) -> Tuple[List[str], List[Dict]]:
         """对精英序列做同义密码子替换, 生成突变体
 
         修复 P1: 突变后检查结构约束 (homopolymer/MFE/stem/GC)，
@@ -478,7 +875,9 @@ class IterationController:
             else:
                 elite_idx = random.randrange(len(elites))
             parent_seq = elites[elite_idx].result.sequence
-            mutated_seq, mutation_record = self._synonymous_substitute(parent_seq, protein_seq)
+            mutated_seq, mutation_record = self._synonymous_substitute(
+                parent_seq, protein_seq, substitutions_per_candidate
+            )
             if mutated_seq is not None and mutated_seq != parent_seq:
                 # 约束预检: 快速检查结构约束 (不需要完整评估)
                 if self._quick_constraint_check(mutated_seq):
@@ -502,7 +901,7 @@ class IterationController:
         """快速结构约束预检 — 不需要完整评估, 仅检查可直接从序列计算的约束
 
         检查: GC%, homopolymer, MFE, max_stem
-        跳过: CAI (需要密码子表), immunogenicity (需要蛋白序列)
+        跳过: CAI (需要密码子表)
         """
         bounds = self.constraint_bounds
 
@@ -516,12 +915,20 @@ class IterationController:
         if max_homo >= bounds.get("max_homopolymer", 999):
             return False
 
-        # MFE (ViennaRNA, 可能耗时但值得检查)
+        # MFE (ViennaRNA): 与正式 ConstraintChecker 使用同一量纲。
         mfe = self.evaluator._compute_mfe(sequence)
-        if mfe > bounds.get("mfe_max", 0):
-            return False
-        if mfe < bounds.get("mfe_min", -99999):
-            return False
+        if "mfe_per_nt_min" in bounds and "mfe_per_nt_max" in bounds:
+            nt_length = len("".join(sequence.split()))
+            if nt_length == 0:
+                return False
+            mfe_nt = mfe / nt_length
+            if not bounds["mfe_per_nt_min"] <= mfe_nt <= bounds["mfe_per_nt_max"]:
+                return False
+        else:
+            if mfe > bounds.get("mfe_max", 0):
+                return False
+            if mfe < bounds.get("mfe_min", -99999):
+                return False
 
         # 最大茎区
         max_stem = self.evaluator._compute_max_stem(sequence)
@@ -531,13 +938,13 @@ class IterationController:
         return True
 
     @staticmethod
-    def _synonymous_substitute(seq: str, protein_seq: str) -> Tuple[Optional[str], Dict]:
-        """对 mRNA 序列做 1~3 个同义密码子替换
+    def _synonymous_substitute(seq: str, protein_seq: str,
+                              substitutions_per_candidate: int = 2) -> Tuple[Optional[str], Dict]:
+        """按中央决策做指定次数的同义替换，保持目标蛋白不变。
 
         Returns: (mutated_sequence_or_None, mutation_record)
           mutation_record = {"num_mutations": N, "mutations": [{"codon_index":..., "old_codon":..., "new_codon":..., "amino_acid":...}]}
         """
-        import re
         mutation_record: Dict[str, Any] = {"num_mutations": 0, "mutations": []}
 
         # 清理序列: 去除空格, 转为 RNA (U 代替 T)
@@ -547,32 +954,42 @@ class IterationController:
 
         # 按密码子拆分
         codons = [clean[i:i+3] for i in range(0, len(clean) - (len(clean) % 3), 3)]
-        if not codons:
+        protein = protein_seq.strip().upper().rstrip("*")
+        if not codons or len(codons) != len(protein) + 1:
+            return None, mutation_record
+        if CODON_TO_AA.get(codons[-1]) != "*":
+            return None, mutation_record
+        if type(substitutions_per_candidate) is not int or not 1 <= substitutions_per_candidate <= 3:
             return None, mutation_record
 
-        # 随机选 1~3 个位置做同义替换
-        num_mut = random.randint(1, min(IterationController.MAX_MUTATIONS_PER_SEQ, len(codons)))
-        positions = random.sample(range(len(codons)), num_mut)
+        # 仅从与输入蛋白一致、且确有替代同义密码子的编码位点中选取。
+        # 起始/终止密码子和无同义替代的 Met、Trp 不会被错误计入次数。
+        eligible = []
+        for pos, aa in enumerate(protein):
+            if CODON_TO_AA.get(codons[pos]) != aa:
+                return None, mutation_record
+            if len(AA_TO_CODONS.get(aa, [])) > 1:
+                eligible.append(pos)
+        if len(eligible) < substitutions_per_candidate:
+            return None, mutation_record
+        positions = random.sample(eligible, substitutions_per_candidate)
 
         new_codons = list(codons)
         for pos in positions:
             old_codon = codons[pos]
             aa = CODON_TO_AA.get(old_codon)
-            if aa is None or aa == "*":   # 跳过终止密码子和未知
-                continue
             alternatives = [c for c in AA_TO_CODONS.get(aa, []) if c != old_codon]
-            if alternatives:
-                new_codon = random.choice(alternatives)
-                new_codons[pos] = new_codon
-                mutation_record["mutations"].append({
-                    "codon_index": pos,
-                    "old_codon": old_codon,
-                    "new_codon": new_codon,
-                    "amino_acid": aa,
-                })
+            new_codon = random.choice(alternatives)
+            new_codons[pos] = new_codon
+            mutation_record["mutations"].append({
+                "codon_index": pos,
+                "old_codon": old_codon,
+                "new_codon": new_codon,
+                "amino_acid": aa,
+            })
 
         mutation_record["num_mutations"] = len(mutation_record["mutations"])
-        if mutation_record["num_mutations"] == 0:
+        if mutation_record["num_mutations"] != substitutions_per_candidate:
             return None, mutation_record
 
         # 2026-08-22: 返回空格分隔格式, 与新生成候选/CAI 优化输出保持一致
@@ -602,6 +1019,14 @@ class IterationController:
             return candidates
 
         num_to_optimize = max(1, int(len(candidates) * ratio))
+        batch_id = len(gen_meta.setdefault("cai_batches", []))
+        gen_meta["cai_batches"].append({
+            "batch_id": batch_id,
+            "source": source_tag,
+            "candidate_count": len(candidates),
+            "application_fraction": ratio,
+            "intensity": intensity,
+        })
         # 随机选择要优化的索引
         optimize_indices = set(random.sample(range(len(candidates)), min(num_to_optimize, len(candidates))))
 
@@ -612,6 +1037,21 @@ class IterationController:
             if optimized_seq != candidates[i]:
                 optimized[i] = optimized_seq
                 cai_count += 1
+                before = candidates[i].replace(" ", "").upper().replace("T", "U")
+                after = optimized_seq.replace(" ", "").upper().replace("T", "U")
+                edits = [
+                    {"codon_index": pos // 3, "old_codon": before[pos:pos + 3],
+                     "new_codon": after[pos:pos + 3]}
+                    for pos in range(0, min(len(before), len(after)), 3)
+                    if before[pos:pos + 3] != after[pos:pos + 3]
+                ]
+                gen_meta.setdefault("cai_edit_details", []).append({
+                    "batch_id": batch_id,
+                    "source": source_tag,
+                    "candidate_index_in_batch": i,
+                    "num_edits": len(edits),
+                    "edits": edits,
+                })
 
         if cai_count > 0:
             print(f"    (CAI 优化: {cai_count}/{len(candidates)} 条候选已优化)")

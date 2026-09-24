@@ -83,11 +83,11 @@ class OrchestratorAgent:
             selected_model = self._fallback_domain_match(host_organism)
             result["selected_model"] = selected_model
 
-        # 确保 class_id 信息存在
-        if "class_id" not in result or result["class_id"] is None:
-            result["class_id"] = species_info.class_id
-        if "class_id_confidence" not in result:
-            result["class_id_confidence"] = species_info.confidence
+        # Reconcile the resolver proposal and the final LLM-selected proxy into
+        # one auditable, internally consistent selection.
+        result["species_info"] = self._reconcile_species_selection(
+            result, species_info, host_organism
+        )
 
         # 用 LLM 建议覆盖默认约束
         if "constraint_bounds" in result:
@@ -95,23 +95,99 @@ class OrchestratorAgent:
                 if k in constraints and v is not None:
                     constraints[k] = v
 
-        # 2026-08-22: 同聚物阈值钳制 — 无论 LLM 提议什么, 强制 >= 10
-        # (此前 LLM 常提议 4, 而真实序列同聚物多为 4-9, 阈值 4 会让绝大多数候选不可行)
-        if constraints.get("max_homopolymer", 10) < 10:
-            constraints["max_homopolymer"] = 10
-
         result["constraint_bounds"] = constraints
         result["model_name"] = NUWA_MODELS[selected_model]["name"]
-        result["species_info"] = {
-            "domain": species_info.domain,
-            "class_id": species_info.class_id,
-            "confidence": species_info.confidence,
-            "matched_name": species_info.matched_name,
-            "reason": species_info.reason,
-            "is_resolved": species_info.is_resolved,
-        }
+        # 2026-08-24: 把 Phase 1 CoT 的完整 LLM 调用日志 (含发送的 prompt) 一并返回,
+        # 否则 main.py 里 decision.get("full_log", []) 永远为空 → 审稿人无法复现提示词。
+        result["full_log"] = self.full_log
 
         return result
+
+    @staticmethod
+    def _reconcile_species_selection(result: dict, species_info: SpeciesInfo,
+                                     host_organism: str) -> dict:
+        """Validate a final class_id and expose resolver-vs-selected provenance."""
+        selected_model = result.get("selected_model", species_info.domain)
+        candidates = list(species_info.candidates)
+        candidate_by_id = {item.class_id: item for item in candidates}
+        raw_class_id = result.get("class_id")
+        if isinstance(raw_class_id, bool) or not isinstance(raw_class_id, int):
+            raw_class_id = species_info.class_id
+
+        chosen = result.get("chosen_candidate")
+        chosen_id = chosen.get("class_id") if isinstance(chosen, dict) else None
+        if isinstance(chosen_id, bool) or not isinstance(chosen_id, int):
+            chosen_id = None
+
+        validation_note = None
+        selected_candidate = None
+        resolution_type = "default"
+
+        if species_info.confidence == "exact":
+            selected_class_id = species_info.class_id
+            selected_name = species_info.matched_name
+            selected_domain = species_info.domain
+            selected_confidence = "exact"
+            resolution_type = "exact"
+        elif (species_info.confidence in ("genus_match", "fuzzy_match")
+              and selected_model == species_info.domain and candidates):
+            selected_candidate = candidate_by_id.get(raw_class_id) or candidate_by_id.get(chosen_id)
+            if selected_candidate is None:
+                selected_candidate = candidates[0]
+                validation_note = (
+                    "LLM class_id was not in the resolver candidate set; used the "
+                    "resolver's top validated candidate."
+                )
+            selected_class_id = selected_candidate.class_id
+            selected_name = selected_candidate.name
+            selected_domain = selected_candidate.domain
+            selected_confidence = species_info.confidence
+            resolution_type = "proxy"
+            why = chosen.get("why", "") if isinstance(chosen, dict) else ""
+            result["chosen_candidate"] = {
+                "name": selected_name,
+                "class_id": selected_class_id,
+                "domain": selected_domain,
+                "why": why or "Validated resolver candidate selected as a host proxy.",
+            }
+        else:
+            selected_class_id = raw_class_id if raw_class_id >= 0 else 0
+            model_size = NUWA_MODELS.get(selected_model, {}).get("num_species", 0)
+            if model_size and selected_class_id >= model_size:
+                selected_class_id = 0
+                validation_note = "Out-of-range LLM class_id replaced with class_id=0."
+            selected_name = None
+            selected_domain = selected_model
+            selected_confidence = "default"
+            resolution_type = "cross_domain_default" if selected_model != species_info.domain else "default"
+            result["chosen_candidate"] = None
+
+        result["class_id"] = selected_class_id
+        result["class_id_confidence"] = selected_confidence
+        level2 = result.setdefault("level2_species", {})
+        level2["class_id"] = selected_class_id
+        level2["class_id_confidence"] = selected_confidence
+
+        return {
+            "query": host_organism,
+            "domain": selected_domain,
+            "class_id": selected_class_id,
+            "confidence": selected_confidence,
+            "matched_name": selected_name,
+            "reason": level2.get("reason", species_info.reason),
+            "is_resolved": resolution_type in ("exact", "proxy"),
+            "proxy_resolved": resolution_type == "proxy",
+            "resolution_type": resolution_type,
+            "validation_note": validation_note,
+            "resolver_match": {
+                "domain": species_info.domain,
+                "suggested_class_id": species_info.class_id,
+                "confidence": species_info.confidence,
+                "matched_name": species_info.matched_name,
+                "reason": species_info.reason,
+            },
+            "candidates": [item.to_dict() for item in candidates],
+        }
 
     def _cot_three_level_decision(self, protein_seq: str, host_organism: str,
                                    species_info: SpeciesInfo,
@@ -207,14 +283,13 @@ Check: extreme GC? Extremophile? Any reason to prefer another domain? Even if no
     "mfe_max": null,
     "mfe_min": null,
     "max_stem_length": null,
-    "max_homopolymer": 10,
-    "safety_threshold": null
+    "max_homopolymer": null
   }}
 }}
 ```
 
 IMPORTANT: Keep text fields CONCISE (2-3 sentences each). Output ONLY valid JSON. Do not write long essays.
-NOTE: For constraint_bounds, set max_homopolymer to 10 (nt) — do not lower it below 10. Leave other fields null to accept the defaults unless the host biology clearly demands tighter bounds."""
+NOTE: Leave constraint fields null to accept the preregistered defaults unless the run configuration explicitly supplies target-specific values."""
 
         result = self._call_llm(
             prompt,
