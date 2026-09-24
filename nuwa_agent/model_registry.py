@@ -6,6 +6,7 @@
 注意: NUWA 没有感知头 — 所有评测分数来自外部生物信息学工具 (evaluator.py)
 """
 
+import math
 import os
 import random
 from typing import Dict, List, Optional
@@ -49,6 +50,16 @@ for _codon, _aa in CODON_TO_AA.items():
     AA_TO_CODONS[_aa].append(_codon)
 
 STOP_CODONS = ["UAA", "UAG", "UGA"]
+
+
+def _validate_temperature(temperature: float) -> float:
+    """Reject temperatures that cannot define a sampling distribution."""
+    try:
+        if isinstance(temperature, bool) or not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError("temperature must be a finite positive number") from None
+    return float(temperature)
 
 
 # --- Tokenizer ---
@@ -189,6 +200,7 @@ class NUWAModelRegistry:
             batch_size: 批量大小
             device: 计算设备
         """
+        temperature = _validate_temperature(temperature)
         model = self.load(model_key, device=device)
 
         if device == "auto":
@@ -257,17 +269,26 @@ class NUWAModelRegistry:
         class_id: int = 0,
     ) -> List[str]:
         """蛋白质约束的向量化生成 (复用 entropy_guide_mRNA_generation.py 逻辑)"""
+        temperature = _validate_temperature(temperature)
         model.eval()
         batch_size = len(target_protein_seqs)
 
-        original_lengths = [len(s) for s in target_protein_seqs]
-        max_len = max(original_lengths)
+        valid_aas = set(CODON_TO_AA.values()) - {'*'}
+        complete_protein_seqs = []
+        for seq in target_protein_seqs:
+            residues = seq[:-1] if seq.endswith('*') else seq
+            if not residues or any(aa not in valid_aas for aa in residues):
+                raise ValueError("protein sequence must contain valid amino acids and only a terminal stop")
+            complete_protein_seqs.append(seq if seq.endswith('*') else seq + '*')
 
-        effective_max_len = min(max_len, tokenizer.model_max_length)
+        original_lengths = [len(seq) for seq in complete_protein_seqs]
+        max_len = max(original_lengths)
         if max_len > tokenizer.model_max_length:
-            original_lengths = [min(l, effective_max_len) for l in original_lengths]
-            target_protein_seqs = [s[:effective_max_len] for s in target_protein_seqs]
-            max_len = effective_max_len
+            raise ValueError(
+                f"protein sequence plus stop has {max_len} codons, "
+                f"exceeding model_max_length={tokenizer.model_max_length}"
+            )
+        target_protein_seqs = complete_protein_seqs
 
         protein_pad_char = 'X'
         if protein_pad_char not in AA_TO_CODONS:
@@ -308,16 +329,16 @@ class NUWAModelRegistry:
         stop_codon_ids = [tokenizer.convert_tokens_to_ids(c) for c in STOP_CODONS if c in tokenizer.vocab]
         for i in range(batch_size):
             length = original_lengths[i]
-            batch_input_ids[i, 0] = tokenizer.convert_tokens_to_ids("AUG")
-            if length > 1:
-                batch_input_ids[i, length - 1] = random.choice(stop_codon_ids)
+            if target_protein_seqs[i][0] == 'M':
+                batch_input_ids[i, 0] = tokenizer.convert_tokens_to_ids("AUG")
+            batch_input_ids[i, length - 1] = random.choice(stop_codon_ids)
 
         forbidden_stop_mask = torch.zeros(tokenizer.vocab_size, dtype=torch.float, device=device)
         for fid in stop_codon_ids:
             if fid is not None:
                 forbidden_stop_mask[fid] = -float('inf')
 
-        num_iterations = max_len - 2
+        num_iterations = max_len - 1
         for step in tqdm(range(num_iterations), desc="Generating", leave=False):
             token_type_ids = torch.full_like(batch_input_ids, fill_value=class_id)
 
@@ -353,7 +374,8 @@ class NUWAModelRegistry:
             )
             selected_logits = torch.gather(active_batch_logits, 1, idx_tensor).squeeze(1)
 
-            selected_logits += forbidden_stop_mask
+            # Use the same temperature for codon sampling and entropy fill order.
+            selected_logits = (selected_logits + forbidden_stop_mask) / temperature
 
             sorted_logits, sorted_indices = torch.sort(selected_logits, descending=True)
             cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)

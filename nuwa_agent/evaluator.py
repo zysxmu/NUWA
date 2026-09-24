@@ -4,26 +4,19 @@ Pareto 软目标 (全部由微调模型驱动):
 - TE: finetuned_model_TE (BertForRegressionHF, Spearman≈0.48)
 - Stability: finetuned_model_fungal (BertForRegressionHF, Spearman≈0.76)
 - Expression: finetuned_model_fungal_euk (BertForRegressionHF, Spearman≈0.77)
-失败时退回启发式 fallback。
+正式实验默认要求这些模型与工具全部可用；仅 demo 可显式启用启发式 fallback。
 
 硬约束 (外部工具):
 - CAI: cai2 / GC: 自定义 / MFE/Stem: ViennaRNA
-- Immunogenicity: MHCflurry / Homopolymer: 自定义
+- Homopolymer: 自定义
 """
 
 import os
-import sys
-
-# Windows: mhcflurry/mhcgnomes 内部 open() 不指定 encoding，默认用 gbk
-# 读 UTF-8 YAML → UnicodeDecodeError。PYTHONUTF8=1 必须在进程启动前设置，
-# os.environ.setdefault 无效，真正修复在 _predict_immunogenicity 中完成。
-
-import json
 import numpy as np
 from dataclasses import dataclass, field
 from config import (
-    DEFAULT_MHC_ALLELES, CODON_TABLES_DIR,
     FINETUNED_TE_MODEL, FINETUNED_STABILITY_MODEL, FINETUNED_EXPR_MODEL,
+    STRICT_EVALUATION,
 )
 
 
@@ -136,7 +129,9 @@ class NUWAScorer:
             input_ids = enc["input_ids"].to(self.device)
             attention_mask = enc["attention_mask"].to(self.device)
             seq_len = input_ids.shape[1]
-            token_type_ids = torch.full((1, seq_len), class_id,
+            type_vocab_size = self._model.config.type_vocab_size
+            safe_class_id = min(int(class_id), type_vocab_size - 1)
+            token_type_ids = torch.full((1, seq_len), safe_class_id,
                                         dtype=torch.long, device=self.device)
 
             with torch.no_grad():
@@ -169,7 +164,6 @@ class EvaluationResult:
     mfe: float = 0.0
     max_stem_len: int = 0
     max_homopolymer: int = 0
-    immunogenicity_risk: float = 0.0
     # Feasibility
     is_feasible: bool = False
     constraint_violations: list = field(default_factory=list)
@@ -179,24 +173,25 @@ class MultiObjectiveEvaluator:
     """
     多目标评估器 — 全部外部生物信息学工具
 
-    3 Objectives (启发式 + ViennaRNA) + 6 Constraints (cai2 + ViennaRNA + MHCflurry + 自定义)
+    3 objectives + 5 sequence-level constraints (cai2 + ViennaRNA + 自定义)
     """
 
     def __init__(self, codon_table: dict = None,
-                 mhc_alleles: list = None,
                  host_organism: str = "Homo sapiens",
-                 use_mhcflurry: bool = True,
                  domain: str = "bacteria",
-                 class_id: int = 0):
+                 class_id: int = 0,
+                 strict: bool = STRICT_EVALUATION):
         self.codon_table = codon_table
-        self.mhc_alleles = mhc_alleles or DEFAULT_MHC_ALLELES
         self.host_organism = host_organism
-        self.use_mhcflurry = use_mhcflurry
         self.domain = domain          # "bacteria" / "eukaryote" / "archaea"
         self.class_id = class_id      # 物种 class_id，传给 token_type_ids
+        self.strict = bool(strict)
 
         # 延迟加载
-        self._mhcflurry_predictor = None
+        self._backend_usage = {
+            "te": None, "stability": None, "expression": None,
+            "cai": None, "folding": None,
+        }
 
         # 微调 NUWA 回归模型 — 三个 Pareto 软目标，全部延迟加载
         self._te_scorer = NUWAScorer(FINETUNED_TE_MODEL)
@@ -205,6 +200,40 @@ class MultiObjectiveEvaluator:
 
         # 打印工具状态（首次初始化时检查）
         self._print_scorer_status()
+
+    def validate_backends(self) -> dict:
+        """Fail before a formal run if a declared quantitative backend is unavailable."""
+        failures = []
+        for name, scorer in (
+            ("TE", self._te_scorer), ("Stability", self._stability_scorer),
+            ("Expression", self._expr_scorer),
+        ):
+            if not scorer.available:
+                failures.append(f"{name} model: {scorer._load_error or 'unavailable'}")
+        try:
+            import RNA  # noqa: F401
+        except Exception as exc:
+            failures.append(f"ViennaRNA: {type(exc).__name__}")
+        if not self.codon_table:
+            failures.append("host codon table: unavailable")
+        try:
+            from cai2 import CAI  # noqa: F401
+        except Exception as exc:
+            failures.append(f"cai2: {type(exc).__name__}")
+        try:
+            import pymoo  # noqa: F401
+        except Exception as exc:
+            failures.append(f"pymoo: {type(exc).__name__}")
+        if failures and self.strict:
+            raise RuntimeError(
+                "Formal evaluation cannot start because required backends are unavailable:\n- "
+                + "\n- ".join(failures)
+            )
+        return {"strict": self.strict, "failures": failures}
+
+    def backend_usage(self) -> dict:
+        """Return the actual scorer/tool path used in this run."""
+        return dict(self._backend_usage)
 
     def _print_scorer_status(self):
         """打印三个微调模型路径（仅首次初始化时调用）"""
@@ -232,7 +261,6 @@ class MultiObjectiveEvaluator:
         mfe = self._compute_mfe(sequence)
         max_stem = self._compute_max_stem(sequence)
         max_homo = self._compute_max_homopolymer(sequence)
-        imm_risk = self._predict_immunogenicity(protein_seq)
 
         return EvaluationResult(
             sequence=sequence,
@@ -244,7 +272,6 @@ class MultiObjectiveEvaluator:
             mfe=mfe,
             max_stem_len=max_stem,
             max_homopolymer=max_homo,
-            immunogenicity_risk=imm_risk,
         )
 
     # ============ Objectives ============
@@ -258,11 +285,15 @@ class MultiObjectiveEvaluator:
         """
         raw = self._te_scorer.predict(sequence, class_id=self.class_id)
         if raw is not None:
+            self._backend_usage["te"] = "NUWA regression model"
             # 用 sigmoid 将原始回归值映射到 (0, 1)
             # TE 训练数据范围约 [-2, 4]，sigmoid(0)=0.5 对应中性预测
             import math
             return 1.0 / (1.0 + math.exp(-raw * 0.5))
 
+        if self.strict:
+            raise RuntimeError("TE regression model failed during strict evaluation")
+        self._backend_usage["te"] = "heuristic fallback"
         # Fallback: 基于 GC + 长度的启发式估算
         clean = self._clean_seq(sequence)
         gc = self._compute_gc(sequence)
@@ -278,9 +309,13 @@ class MultiObjectiveEvaluator:
         """
         raw = self._stability_scorer.predict(sequence, class_id=self.class_id)
         if raw is not None:
+            self._backend_usage["stability"] = "NUWA regression model"
             import math
             return 1.0 / (1.0 + math.exp(-raw * 0.5))
 
+        if self.strict:
+            raise RuntimeError("Stability regression model failed during strict evaluation")
+        self._backend_usage["stability"] = "ViennaRNA heuristic fallback"
         # Fallback: ViennaRNA MFE 归一化
         mfe = self._compute_mfe(sequence)
         clean = self._clean_seq(sequence)
@@ -297,9 +332,13 @@ class MultiObjectiveEvaluator:
         """
         raw = self._expr_scorer.predict(sequence, class_id=self.class_id)
         if raw is not None:
+            self._backend_usage["expression"] = "NUWA regression model"
             import math
             return 1.0 / (1.0 + math.exp(-raw * 0.5))
 
+        if self.strict:
+            raise RuntimeError("Expression regression model failed during strict evaluation")
+        self._backend_usage["expression"] = "TE+CAI heuristic fallback"
         # Fallback: TE + CAI 综合估算
         te = self._predict_te(sequence)
         cai = self._compute_cai(sequence)
@@ -323,10 +362,16 @@ class MultiObjectiveEvaluator:
                 if len(dna_seq) % 3 != 0:
                     dna_seq = dna_seq[:len(dna_seq) - (len(dna_seq) % 3)]
                 if len(dna_seq) >= 3:
-                    return CAI(dna_seq, weights=self.codon_table)
-        except (ImportError, Exception):
-            pass
+                    value = CAI(dna_seq, weights=self.codon_table)
+                    self._backend_usage["cai"] = "cai2 with host codon table"
+                    return value
+        except Exception as exc:
+            if self.strict:
+                raise RuntimeError("CAI computation failed during strict evaluation") from exc
 
+        if self.strict:
+            raise RuntimeError("CAI requires cai2 and a host codon table in strict evaluation")
+        self._backend_usage["cai"] = "GC heuristic fallback"
         # Fallback: 基于 GC 含量的粗略估算
         gc = self._compute_gc(sequence)
         return 0.5 + 0.3 * (1 - abs(gc - 0.55))
@@ -347,10 +392,13 @@ class MultiObjectiveEvaluator:
             import RNA
             clean = self._clean_seq(sequence)
             _, mfe = RNA.fold(clean)
+            self._backend_usage["folding"] = "ViennaRNA"
             return mfe
-        except ImportError:
-            pass
+        except Exception as exc:
+            if self.strict:
+                raise RuntimeError("ViennaRNA MFE computation failed") from exc
 
+        self._backend_usage["folding"] = "length heuristic fallback"
         # Fallback: 经验公式 (每 nt 约 -0.5 kcal/mol)
         clean = self._clean_seq(sequence)
         return -0.5 * len(clean) if clean else 0.0
@@ -361,6 +409,7 @@ class MultiObjectiveEvaluator:
             import RNA
             clean = self._clean_seq(sequence)
             structure, _ = RNA.fold(clean)
+            self._backend_usage["folding"] = "ViennaRNA"
             max_run = current = 0
             for c in structure:
                 if c in "()":
@@ -369,8 +418,10 @@ class MultiObjectiveEvaluator:
                 else:
                     current = 0
             return max_run // 2
-        except ImportError:
-            pass
+        except Exception as exc:
+            if self.strict:
+                raise RuntimeError("ViennaRNA structure computation failed") from exc
+        self._backend_usage["folding"] = "constant stem fallback"
         return 10  # fallback
 
     def _compute_max_homopolymer(self, sequence: str) -> int:
@@ -392,111 +443,6 @@ class MultiObjectiveEvaluator:
             else:
                 current = 1
         return max_run
-
-    # 类级别标志，全局只打印一次 MHCflurry 警告
-    _mhcflurry_warned = False
-
-    def _predict_immunogenicity(self, protein_seq: str) -> float:
-        """
-        免疫原性 — MHCflurry Class1AffinityPredictor (含可变 fallback)
-
-        扫描蛋白 9-mer → MHC-I 结合亲和力预测 → 转换为风险分数
-        亲和力越低 → 结合越强 → 免疫原性风险越高
-        转换: score = max(0, min(1, (6 - log10(affinity_nM)) / 6))
-          1 nM → 1.0, 10 nM → 0.83, 100 nM → 0.67, 500 nM → 0.55
-          1000 nM → 0.5, 5000 nM → 0.38, >1e6 nM → 0
-
-        输出: [0,1], >0.5 为高风险
-
-        NOTE: 同一蛋白的不同密码子变体在 MHC-I 表位层面免疫原性相同
-        (因为氨基酸序列不变)。如需区分候选序列，看 Expression/TE/Stability。
-        本函数在 fallback 模式下加入轻微序列相关扰动以产生区分度。
-        """
-        if self.use_mhcflurry:
-            try:
-                if self._mhcflurry_predictor is None:
-                    import logging
-                    logging.getLogger('mhcflurry').setLevel(logging.ERROR)
-
-                    # Windows: mhcgnomes 的 data.py 用 open() 读 YAML 不指定 encoding，
-                    # 系统默认 gbk 读 UTF-8 文件 → UnicodeDecodeError (Py3.13 之前)。
-                    # PYTHONUTF8=1 需进程启动前设置，运行时 os.environ 修改无效，
-                    # 故在 import mhcflurry 前临时补丁 builtins.open 默认 UTF-8。
-                    _open_patched = False
-                    if sys.platform == "win32":
-                        import builtins as _bi
-                        _orig_open = _bi.open
-                        def _utf8_open(file, mode='r', buffering=-1, encoding=None,
-                                       errors=None, newline=None, closefd=True, opener=None):
-                            if encoding is None and isinstance(mode, str) and 'b' not in mode:
-                                encoding = 'utf-8'
-                            return _orig_open(file, mode, buffering, encoding,
-                                              errors, newline, closefd, opener)
-                        _bi.open = _utf8_open
-                        _open_patched = True
-
-                    import mhcflurry
-
-                    models_dir = (
-                        r'C:\Users\30778\AppData\Local\mhcflurry'
-                        r'\mhcflurry\4\2.2.0\models_class1\models'
-                    )
-                    if not os.path.exists(models_dir):
-                        raise FileNotFoundError(
-                            f"MHCflurry models not found at {models_dir}. "
-                            f"Run: mhcflurry-downloads fetch models_class1"
-                        )
-                    self._mhcflurry_predictor = mhcflurry.Class1AffinityPredictor.load(
-                        models_dir=models_dir
-                    )
-
-                    # 恢复原始 open，避免影响后续代码
-                    if _open_patched:
-                        _bi.open = _orig_open
-
-                peptides = [protein_seq[i:i+9] for i in range(len(protein_seq) - 8)]
-                if not peptides:
-                    return 0.0
-
-                # 收集所有 peptide × allele 的分数，取 P95 而非 max
-                # max 对长蛋白过于严苛：200+ aa 蛋白必有少数强 MHC-I 表位
-                # P95 排除极端离群值同时保留整体免疫原性信号
-                all_scores = []
-                for allele in self.mhc_alleles:
-                    try:
-                        affinities = self._mhcflurry_predictor.predict(
-                            peptides=peptides,
-                            alleles=[allele] * len(peptides),
-                        )
-                        affinities = np.asarray(affinities, dtype=float).flatten()
-                        scores = np.clip(
-                            (6.0 - np.log10(np.maximum(1.0, affinities))) / 6.0,
-                            0.0, 1.0
-                        )
-                        all_scores.extend(scores.tolist())
-                    except (ValueError, KeyError):
-                        continue
-                if not all_scores:
-                    return 0.0
-                # P95: 排除最极端 5% 的离群肽段，更稳健
-                return float(np.percentile(all_scores, 95))
-            except (ImportError, Exception) as e:
-                if not MultiObjectiveEvaluator._mhcflurry_warned:
-                    print(f"  [Evaluator] ⚠️ MHCflurry 不可用 ({type(e).__name__})，使用 fallback。"
-                          f" 同一蛋白的候选序列免疫原性分数将保持相似。")
-                    MultiObjectiveEvaluator._mhcflurry_warned = True
-
-        # Fallback: 基于氨基酸多样性 + 亲水性估算 (带轻微随机种子区分候选)
-        # 即使 MHCflurry 不可用，也能给出合理且可区分的估算
-        unique_ratio = len(set(protein_seq)) / max(len(protein_seq), 1)
-        # 统计疏水残基 (ILVFWM) — 疏水区更可能暴露为 T 细胞表位
-        hydrophobic = sum(1 for aa in protein_seq if aa in "ILVFWM")
-        hydro_ratio = hydrophobic / max(len(protein_seq), 1)
-        # 组合: 多样性低 + 疏水残基多 → 风险略高
-        base_risk = max(0.0, 0.45 - unique_ratio * 0.3 + hydro_ratio * 0.15)
-        # 轻微抖动 (<0.003)，产生候选间区分 (基于蛋白序列 hash)
-        jitter = hash(protein_seq) % 1000 / 1000000.0
-        return min(1.0, max(0.0, base_risk + jitter))
 
     # ============ 辅助 ============
 
@@ -525,21 +471,6 @@ def check_tool_availability():
         tools["cai2"] = "available"
     except ImportError:
         tools["cai2"] = "not installed (pip install cai2)"
-
-    # MHCflurry
-    try:
-        import mhcflurry  # noqa: F401
-        models_dir = (
-            r'C:\Users\30778\AppData\Local\mhcflurry'
-            r'\mhcflurry\4\2.2.0\models_class1\models'
-        )
-        import os
-        if os.path.exists(models_dir):
-            tools["MHCflurry"] = f"available (models loaded from {os.path.basename(models_dir)})"
-        else:
-            tools["MHCflurry"] = "package installed but models not downloaded"
-    except ImportError:
-        tools["MHCflurry"] = "not installed (pip install mhcflurry)"
 
     # pymoo
     try:

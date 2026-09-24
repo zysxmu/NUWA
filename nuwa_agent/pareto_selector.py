@@ -2,6 +2,7 @@
 
 import numpy as np
 from dataclasses import dataclass
+from typing import Optional
 from evaluator import EvaluationResult
 
 
@@ -15,16 +16,21 @@ class ParetoSolution:
 class ParetoSelector:
     """Pareto 最优选择器 + Hypervolume 计算"""
 
-    def select(self, results: list, top_k: int = 10) -> list:
-        """Pareto 选择: 可行解优先 → 非支配排序 → 拥挤度 → Top-K"""
+    def select(self, results: list, top_k: Optional[int] = None) -> list:
+        """可行解优先 → 非支配排序 → 拥挤度。
+
+        ``top_k=None`` 返回完整排序结果，供完整 Pareto 前沿与 HV 计算；
+        ``top_k`` 仅用于确有需要的展示或父本选择，不能先截断再计算 HV。
+        """
 
         feasible = [r for r in results if r.is_feasible]
         infeasible = [r for r in results if not r.is_feasible]
 
         if not feasible:
             infeasible.sort(key=lambda r: len(r.constraint_violations))
+            limit = len(infeasible) if top_k is None else top_k
             return [ParetoSolution(r, rank=999, crowding_distance=0.0)
-                    for r in infeasible[:top_k]]
+                    for r in infeasible[:limit]]
 
         obj_matrix = np.array([
             [r.te_score, r.stability_score, r.expression_score]
@@ -45,7 +51,7 @@ class ParetoSelector:
                 ))
 
         solutions.sort(key=lambda s: (s.rank, -s.crowding_distance))
-        return solutions[:top_k]
+        return solutions if top_k is None else solutions[:top_k]
 
     def compute_hypervolume(self, solutions: list,
                             reference_point: np.ndarray = None) -> float:

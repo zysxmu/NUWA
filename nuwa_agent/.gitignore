@@ -11,11 +11,7 @@ __pycache__/
 
 # ---- 运行输出 ----
 output/
-data/
-results/
 *.log
-*.csv
-*.jsonl
 
 # ---- 编辑器 / 系统 ----
 .vscode/
