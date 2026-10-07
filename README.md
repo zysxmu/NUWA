@@ -177,6 +177,22 @@ Please download the dataset from [here](https://github.com/Sanofi-Public/CodonBE
 
 
 
+## NUWA-Agent
+
+The agentic mRNA-design workflow is available in
+[`nuwa_agent/`](nuwa_agent/). It combines host-aware NUWA generation with
+sequence-level constraints, fixed surrogate ranking objectives, Pareto
+selection, and auditable LLM-based search scheduling.
+
+- [NUWA-Agent installation and usage](nuwa_agent/README.md)
+- [LLM prompt templates and message flow](nuwa_agent/docs/LLM_PROMPTS.md)
+- [Reproducibility archive index](nuwa_agent/reproducibility/README.md)
+
+The surrogate scores used by NUWA-Agent are computational ranking objectives;
+they should not be interpreted as universally validated host-specific
+measurements. The repository does not include API credentials or model-weight
+files.
+
 ## Acknowledgment
 
 This code is based on CodonTransformer and CodonBert, and we appreciate their excellent works! The citations of CodonTransformer and CodonBert are provided as follows:

@@ -1,163 +1,284 @@
-# NUWA-Agent — 服务器部署包
+# NUWA-Agent
 
-本文件夹是**可直接上传到 Linux 服务器运行**的干净版本，已剔除：
-本地含 API key 的 `config.py`、`.bak` 备份、`__pycache__`、`output/` 运行结果、权重文件（太大，单独传）。
+NUWA-Agent is the agentic mRNA-design component built on top of the NUWA
+foundation model. Given a target protein sequence and an expression host, it
+selects a domain-specific NUWA generator, produces synonymous coding sequences,
+evaluates them with fixed surrogate predictors and sequence-level constraints,
+and maintains a Pareto front during iterative search.
 
----
+The optimization results should be interpreted as a proof of concept using
+available surrogate predictors. Host awareness applies to species resolution,
+domain-model selection, generator conditioning, codon usage, and configured
+sequence constraints. The translation-efficiency, stability, and expression
+scores are fixed computational ranking objectives and are not universally
+validated host-specific measurements.
 
-## 1. 目录结构
+## Repository layout
 
+```text
+nuwa_agent/
+├── main.py                  # Main command-line entry point
+├── run_demo.py              # Small smoke-test example
+├── batch_run.py             # Batch runner for prepared input sets
+├── config.py                # Environment-based configuration
+├── species_resolver.py      # Host name -> domain and species class ID
+├── orchestrator.py          # Initial model/species orchestration
+├── model_registry.py        # NUWA model loading and sequence generation
+├── evaluator.py             # Surrogate scoring and sequence metrics
+├── constraint_checker.py    # Feasibility checks
+├── pareto_selector.py       # Non-dominated sorting and hypervolume
+├── round_deliberation.py    # Six-stage round-level LLM deliberation
+├── iteration_controller.py  # Iterative search and controller guardrails
+├── feedback_analyzer.py     # Correlation helper and legacy feedback code
+├── docs/
+│   └── LLM_PROMPTS.md       # Prompt templates and message flow
+├── reproducibility/
+│   ├── README.md            # English index of released records
+│   ├── nuwa_output_full_20260923.zip
+│   └── nuwa_EPO_NanoLuc_20260924.zip
+├── tests/
+└── requirements.txt
 ```
-nuwa_server_upload/
-├── nuwa_agent/                 # 全部源码（run 目录，脚本在此执行）
-│   ├── config.py               # 服务器版配置（BASE_DIR 派生路径 + 环境变量读 key）
-│   ├── main.py                 # 主入口（交互式：蛋白序列 → 宿主 → 约束）
-│   ├── run_demo.py             # 一键 demo（EGFP 片段 + E.coli，自动降参）
-│   ├── orchestrator.py         # Phase 1 三层 CoT 选模型 + 约束决策
-│   ├── model_registry.py       # NUWA 域模型加载 + 熵引导生成
-│   ├── evaluator.py            # 3 软目标 (TE/Stability/Expression) + 6 硬约束
-│   ├── constraint_checker.py   # 约束可行性判定
-│   ├── pareto_selector.py      # NSGA-II 非支配排序 + 超体积
-│   ├── round_deliberation.py   # 专家 Agent 讨论 + Central LLM 决策
-│   ├── feedback_analyzer.py    # 分数相关性分析与旧版反馈实现
-│   ├── iteration_controller.py # 迭代循环、策略执行 + 收敛判定
-│   ├── species_resolver.py     # 物种名 → (domain, class_id)
-│   ├── .gitignore
-│   └── __init__.py
-├── requirements.txt            # pip 依赖
-└── README.md                   # 本文
-```
 
-> **权重不放进本包**（约 6.7 GB）。请单独把 `nuwa_weights/` 传到服务器，
-> 并放在 `nuwa_agent/` 的**上级目录**（即 `nuwa_server_upload/nuwa_weights/`），
-> 或任意目录并用环境变量 `NUWA_BASE_DIR` 指定。
+Model weights are not included in the repository. The released checkpoints
+occupy several gigabytes and must be downloaded or transferred separately.
 
----
+## Requirements
 
-## 2. 上传到服务器
+- Linux is recommended for formal runs.
+- Python 3.10
+- A CUDA-capable GPU is recommended for NUWA generation and scoring.
+- ViennaRNA Python bindings (`RNA`)
+- `cai2`
+- Access to the configured OpenAI-compatible LLM endpoint when LLM scheduling
+  is enabled
 
-任选一种：
+Create an environment and install the Python dependencies:
 
 ```bash
-# 方式 A：scp 整个文件夹
-scp -r nuwa_server_upload/ user@server:/your/workdir/
+conda create -n nuwa-agent python=3.10 -y
+conda activate nuwa-agent
 
-# 方式 B：rsync（断点续传，适合大目录）
-rsync -avz nuwa_server_upload/ user@server:/your/workdir/nuwa_server_upload/
-```
-
-权重（单独传，示例放在上级目录）：
-
-```bash
-rsync -avz /d/thesis/NUWA-main\ \(1\)/nuwa_weights/ \
-      user@server:/your/workdir/nuwa_server_upload/nuwa_weights/
-```
-
----
-
-## 3. 环境准备（服务器）
-
-```bash
-# 3.1 新建 conda 环境（推荐，便于装 ViennaRNA）
-conda create -n nuwa python=3.10 -y
-conda activate nuwa
-
-# 3.2 pip 依赖
-cd /your/workdir/nuwa_server_upload
+cd /path/to/NUWA/nuwa_agent
 pip install -r requirements.txt
-
-# 3.3 外部生物信息学工具
-conda install -c bioconda viennarna -y     # RNA.fold 折叠
-pip install cai2                            # CAI 计算
-
-# 3.4 设置智谱 AI key（务必，config.py 不再写死明文）
-export NUWA_API_KEY="你的智谱AI key"
+conda install -c bioconda viennarna -y
+pip install cai2
 ```
 
-> 未安装外部工具时 `evaluator.py` 会自动回退到启发式估算，代码可跑但分数不精确。
-> LLM 调用需要服务器能访问 `https://open.bigmodel.cn`（出网权限）。
+Formal evaluation requires the external biological tools. Heuristic fallbacks
+may be useful for software debugging but must not be used as formal experimental
+results.
 
----
+## Model and data layout
 
-## 4. 路径配置（两种写法，二选一）
+By default, `config.py` resolves `NUWA_BASE_DIR` to the parent directory of
+`nuwa_agent/`. The expected layout is:
 
-权重位置由 `nuwa_agent/config.py` 里的 `BASE_DIR` 决定：
-
-- **默认**：`BASE_DIR` = `nuwa_agent/` 的父目录。
-  也就是说只要把 `nuwa_weights/` 放在 `nuwa_server_upload/nuwa_weights/` 下，无需任何改动即可运行。
-
-- **自定义**：若权重放在别处，设环境变量即可，不用改文件：
-
-  ```bash
-  export NUWA_BASE_DIR=/abs/path/to/parent_of_nuwa_weights
-  ```
-
-config.py 期望的权重布局：
-
+```text
+$NUWA_BASE_DIR/
+├── nuwa_agent/
+└── nuwa_weights/
+    ├── domain_models/
+    │   ├── bacteria/checkpoint-*
+    │   ├── eukaryote/checkpoint-*
+    │   └── archaea/checkpoint-*
+    ├── finetuned/
+    │   ├── te/checkpoint-1000
+    │   ├── stability/checkpoint-1000
+    │   └── expression/checkpoint-1000
+    ├── species_maps/
+    │   ├── bacteria_species_mapping.json
+    │   ├── eukaryote_species_mapping.json
+    │   └── archaea_species_mapping.json
+    └── codon_tables/
+        └── *.json
 ```
-$NUWA_BASE_DIR/nuwa_weights/
-├── domain_models/{bacteria,eukaryote,archaea}/checkpoint-*
-├── finetuned/{te,stability,expression}/checkpoint-1000
-├── species_maps/{bacteria,eukaryote,archaea}_species_mapping.json
-└── codon_tables/*.json
-```
 
----
-
-## 5. 运行
+If the weights are stored elsewhere, set:
 
 ```bash
-cd /your/workdir/nuwa_server_upload/nuwa_agent
-export NUWA_API_KEY="你的智谱AI key"     # 若还没设
+export NUWA_BASE_DIR=/absolute/path/to/the/directory/containing/nuwa_weights
+```
 
-# 5.1 一键 demo（EGFP 30aa + E.coli，3 轮快速验证）
+## API credentials
+
+The repository does not contain an API key. Supply the credential through an
+environment variable:
+
+```bash
+export NUWA_API_KEY="YOUR_API_KEY"
+```
+
+Do not write a credential into `config.py`, commit it to Git, or include it in
+a reproducibility archive. The generated audit artifacts do not contain
+`NUWA_API_KEY`.
+
+## Running NUWA-Agent
+
+### Smoke test
+
+```bash
+cd /path/to/NUWA/nuwa_agent
 python run_demo.py
+```
 
-# 5.2 正式运行：种子与目标特异 MFE/nt 窗口均为必填
+The smoke test verifies installation and model loading. It is not a formal
+experiment.
+
+### Formal single-target run
+
+Formal runs require an explicit random seed and a target-specific MFE/nt
+interval:
+
+```bash
+cd /path/to/NUWA/nuwa_agent
+
+export NUWA_API_KEY="YOUR_API_KEY"
 export NUWA_RUN_SEED=20260918
 export NUWA_MFE_PER_NT_MIN=-0.35
 export NUWA_MFE_PER_NT_MAX=-0.20
-# 正式模式默认对生成模型和三个回归 checkpoint 的所有文件做 SHA256；请勿关闭。
 export NUWA_AUDIT_HASH_MODELS=1
+
+python main.py \
+  --protein-file /path/to/one_protein.fasta \
+  --protein-id NP_000000.1 \
+  --host "Escherichia coli" \
+  --gc-min 0.30 \
+  --gc-max 0.70
+```
+
+The interactive form is also available:
+
+```bash
 python main.py
-#   依次输入：蛋白序列(FASTA或裸序列) → 宿主名(如 Escherichia coli) → GC 约束(可留空)
+```
 
-# 非交互式单条运行（推荐同时提供稳定 protein-id）
-python main.py --protein-file /path/one_protein.fasta --protein-id NP_000000.1 \
-  --host "Escherichia coli" --gc-min 0.3 --gc-max 0.7
+### Rule-based scheduling control
 
-# 可选：运行确定性基准策略（默认启用多 Agent 讨论）
+The LLM deliberation can be disabled while retaining the same generator,
+evaluators, constraints, Pareto selection, and controller guardrails:
+
+```bash
 export NUWA_MULTIAGENT_ENABLED=0
 python main.py
 ```
 
-Phase 2 每轮先执行上一轮选定的温度和同义密码子替换策略，再生成、评分、检查约束并计算 Pareto 前沿与 HV。三个专家 Agent 分别讨论生物约束、生成探索和同义编辑，经过质疑与修订后由 Central LLM 给出下一轮的结构化决策：生成温度、新生成/突变比例、每条突变子代的同义替换次数及精英父本选择。代码会校验参数、限制策略单轮跳变，并在持续退化时启用保守恢复；CAI 调整仍按确定性计划执行。单个讨论阶段会独立重试，未通过校验的原文不会传给后续 Agent；Central LLM 失败时优先从已验证的专家结论合成安全决定，没有足够有效结论时才回退到预设策略。当前轮 HV 明显低于历史最优时继续使用历史最优前沿作父本。硬约束、评分、Pareto 选择及 HV 计算均由程序完成。`NUWA_MULTIAGENT_ENABLED=0` 可关闭讨论，运行相同的基准策略。
+## LLM prompt workflow
 
-输出包括：`./output/nuwa_agent_<时间戳>.json`（机器可读完整记录）、`nuwa_agent_reviewer_<时间戳>.md`（审稿人优先阅读的精简报告）和 `nuwa_agent_chain_<时间戳>.md`（完整 prompt/response 审计附录）。结果采用原子写入，不会留下半截 JSON/Markdown。正式模式必须设置 `NUWA_RUN_SEED`；否则程序会在生成前终止。
+The active LLM workflow contains:
 
-JSON 的 `run_metadata` 保存完整输入蛋白、蛋白 SHA256、宿主、随机种子、Python/依赖版本、全部 Python 源码指纹、密码子表指纹以及四套模型制品的逐文件 SHA256 和 manifest SHA256。默认在严格模式下启用模型内容哈希；大型 checkpoint 第一次计算可能需要一些时间。最终 `pareto_solutions[].sequence` 是无空格大写 RNA，`sequence_codon_spaced` 仅供阅读，`sequence_length` 始终按无空格序列计算。原始生成历史为了审计可能继续保留密码子分隔格式。
+1. One initial orchestration call for domain-model selection, species-class
+   selection, and constraint configuration.
+2. Two independent round-level proposals: generation/exploration and
+   synonymous editing/exploitation.
+3. A biology and constraint review that receives both proposals.
+4. A generation revision.
+5. An editing revision that also receives the generation revision.
+6. A central next-round decision that receives the complete validated
+   discussion.
 
-保存前程序还会生成 `artifact_validation`，自动检查输入哈希、模型制品哈希、物种 class ID、逐轮决策衔接、历史最佳轮来源、规范序列、终止密码子和全部 active hard constraints。正式结果应满足 `artifact_validation.passed=true`；若为 false，控制台会打印 `AUDIT WARNING`，该次结果不得作为正式实验有效结果。
+The fixed prompt templates, output fields, and inter-call message flow are
+documented in [`docs/LLM_PROMPTS.md`](docs/LLM_PROMPTS.md).
 
-`iteration_history` 明确区分：`central_requested_decision`（LLM 对下一轮的原始请求）、`guardrail_adjusted_decision`（控制器校验后的下一轮参数）和 `applied_decision`（生成当前轮时真实执行的参数）；`decision_for_round` 给出决定适用的轮次。自由文本理由只保留在原始请求中，权威执行摘要由最终数值自动生成，避免护栏调整后文字与字段矛盾。物种元数据同时记录最终代理和 `resolver_match` 初始建议；MFE 报告明确区分 active 与 inactive legacy bounds；精英突变记录包含同义突变、CAI 后处理和最终评估序列的完整 provenance chain。`optimization_result.best_hv` 是返回解对应的历史最优 HV，`last_round_hv` 是真实末轮 HV。输出不包含 `NUWA_API_KEY`。固定种子控制本地 Python/NumPy/PyTorch 随机过程；远端 LLM 响应及某些 GPU 运算仍可能存在差异，因此完整请求与响应也会保存在审计附录中。
+`feedback_analyzer.py` contains a deprecated legacy feedback-generation method.
+It is not the active LLM decision path for the released multi-agent runs. The
+current controller uses `FeedbackAnalyzer._compute_score_correlations()` only
+to construct numerical round evidence; next-round LLM decisions are produced
+by `RoundDeliberation` in `round_deliberation.py`.
 
----
+## Optimization workflow
 
-## 6. 常见问题
+For each evaluated round, NUWA-Agent:
 
-| 现象 | 原因 / 处理 |
-|------|------------|
-| `请先设置环境变量 NUWA_API_KEY` | 没 export key，先 `export NUWA_API_KEY=...` |
-| 模型权重 `FileNotFoundError` | `BASE_DIR` 指错或 `nuwa_weights/` 没传；检查第 4 节布局 |
-| `No module named 'RNA'` / `cai2` | 外部工具未装；按 3.3 安装；正式实验模式会立即停止 |
-| 连不上 `open.bigmodel.cn` | 服务器无出网权限，联系管理员放通 443 |
-| 某轮讨论失败 | 查看输出中的 `discussion_fallback_used` 和 `discussion_error`；下一轮会采用预设的确定性策略 |
-| CUDA OOM | 减小 `config.NUM_CANDIDATES` 或用 CPU（改 `device`） |
+1. generates new candidates and, after the first round, synonymous mutants of
+   selected parents;
+2. optionally applies the deterministic CAI post-processing schedule;
+3. evaluates the three fixed surrogate scores;
+4. calculates CAI, GC content, length-normalized MFE, maximum stem length, and
+   maximum homopolymer length;
+5. removes candidates that violate an active hard constraint;
+6. performs non-dominated sorting and calculates hypervolume;
+7. records the numerical evidence used by the next-round scheduler; and
+8. validates and bounds any proposed search parameters before execution.
 
----
+The audit record distinguishes:
 
-## 7. 与本地旧版的差异（迁移说明）
+- `central_requested_decision`: the raw central LLM proposal;
+- `guardrail_adjusted_decision`: the validated and bounded proposal for the
+  next round; and
+- `applied_decision`: the parameters actually used to generate the current
+  round.
 
-- 旧 `config.py` 写死 `D:/thesis/...` Windows 路径 → 本包改为 `BASE_DIR` 派生 + 环境变量。
-- 旧 `config.example.py` 指向已删除的 `virtual-lab-main/NUWA-*-model`、`finetuned_model_*` → 本包已废弃该模板，路径统一走 `nuwa_weights/`。
-- Phase 2 已加入专家讨论与 Central LLM 决策。新旧策略、运行种子与每轮实际参数需要分别记录，重跑结果不应与旧结果视为同一实验配置。
+The decision produced after Round `r` applies to Round `r+1`; it must not be
+interpreted as a description of a round that has already been evaluated.
+
+## Outputs
+
+Each completed run writes three files to `output/`:
+
+```text
+nuwa_agent_<timestamp>.json
+nuwa_agent_chain_<timestamp>.md
+nuwa_agent_reviewer_<timestamp>.md
+```
+
+- The JSON file is the authoritative machine-readable record.
+- The chain report is a readable rendering of the prompt/response transcript.
+- The reviewer report is a compact run summary.
+
+The JSON record includes the input sequence and digest, host, random seed,
+software and dependency versions, source-code fingerprints, codon-table
+fingerprints, model-artifact manifests, candidate histories, constraint
+outcomes, Pareto fronts, hypervolume values, LLM messages, and returned
+sequences.
+
+Formal records should satisfy:
+
+```text
+artifact_validation.passed = true
+```
+
+If validation fails, the console prints an `AUDIT WARNING`; that run should not
+be used as a formal result.
+
+## Reproducibility notes
+
+- A fixed run seed controls the local Python, NumPy, and PyTorch random states.
+- Remote LLM responses and some GPU operations may still vary.
+- Complete prompts and responses are retained in the audit record.
+- Raw historical records are preserved unchanged. English documentation is
+  provided separately so that executed prompts and responses are not silently
+  rewritten.
+- Candidates within one run are not independent biological replicates.
+- Surrogate scores are computational ranking objectives rather than measured
+  host-specific expression, half-life, or folding stability.
+
+See [`reproducibility/README.md`](reproducibility/README.md) for an English
+index of the released archives.
+
+## Running tests
+
+From the repository root:
+
+```bash
+PYTHONPATH="$(pwd)" python -m pytest nuwa_agent/tests -q -p no:cacheprovider
+```
+
+## Troubleshooting
+
+| Problem | Check |
+|---|---|
+| Missing `NUWA_API_KEY` | Export the environment variable before enabling LLM scheduling. |
+| Model `FileNotFoundError` | Verify `NUWA_BASE_DIR` and the `nuwa_weights/` layout. |
+| `No module named RNA` | Install ViennaRNA in the active environment. |
+| `cai2` unavailable | Install `cai2` and rerun the formal backend check. |
+| LLM endpoint unavailable | Check network access and the configured base URL. |
+| A deliberation phase fails | Inspect `discussion_fallback_used`, `discussion_error`, and the transcript. |
+| CUDA out of memory | Reduce the candidate batch size or use a device with more memory. |
+
+## Citation and scope
+
+If you use NUWA-Agent, cite the associated NUWA/NUWA-Agent manuscript and the
+released code version or commit. Report the exact model checkpoints, run seed,
+constraint configuration, candidate-evaluation budget, LLM model, and whether
+LLM or rule-based scheduling was enabled.
